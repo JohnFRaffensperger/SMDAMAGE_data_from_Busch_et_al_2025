@@ -1,0 +1,29 @@
+# Python cache and local environments
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+Output/.venv/
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+
+# Original Busch files removed from public git tracking
+DO code/*.do
+Input/*.dta
+Output/maps/*.dta
+
+# SQLite databases produced/updated by import/export pipelines
+Output/Databases/*.sqlite
+
+# Large generated artifacts from pipeline scripts
+Output/Kmeans_temp_files/*.csv
+
+# Local reference materials
+References/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/

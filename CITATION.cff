@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+title: "Busch2024 Data Documentation and SMDAMAGE Phase-One Integration"
+message: "If you use this repository, please cite this software and the upstream Busch et al. paper and Zenodo dataset."
+type: software
+authors:
+  - family-names: Raffensperger
+    given-names: John F.
+repository-code: "https://github.com/JohnFRaffensperger/SMDAMAGE_data_from_Busch_et_al_2025.git"
+license: MIT
+date-released: 2026-06-13
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Busch
+      given-names: J.
+    - family-names: Bukoski
+      given-names: J. J.
+    - family-names: Cook-Patton
+      given-names: S. C.
+    - family-names: Griscom
+      given-names: B.
+    - family-names: Kaczan
+      given-names: D.
+    - family-names: Potts
+      given-names: M. D.
+    - family-names: Yi
+      given-names: Y.
+    - family-names: Vincent
+      given-names: J. R.
+  title: "Cost-effectiveness of natural forest regeneration and plantations for climate mitigation"
+  journal: "Nature Climate Change"
+  year: 2024
+  doi: "10.1038/s41558-024-02068-1"

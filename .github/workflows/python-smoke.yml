@@ -1,0 +1,30 @@
+name: python-smoke
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Syntax check active scripts
+        run: |
+          python -m py_compile "JFR code/1_k_means_carbon_removal.py"
+          python -m py_compile "JFR code/2_import_k_means_csv_to_sqlite.py"
+          python -m py_compile "JFR code/3_choose_harvest_years.py"
+          python -m py_compile "JFR code/4_move_Busch_data_to_SMDAMAGE.py"

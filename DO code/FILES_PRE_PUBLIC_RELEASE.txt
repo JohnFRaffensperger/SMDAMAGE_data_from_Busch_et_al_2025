@@ -1,0 +1,23 @@
+﻿Directory manifest for public-release provenance
+Generated: 2026-06-13 16:35:49
+Directory: .\DO code
+Purpose: Record Stata source files originally present in DO code.
+
+This repository release removes these original source/data files from git tracking.
+The list below records which files were present locally in this directory.
+
+File count: 12
+
+Files:
+- 1. Model loop all data corrected.do
+- 1. Model loop all data.do
+- 10. Sensitivity analysis 13-15.do
+- 11. Sensitivity analysis generate and display results for manuscript (13-15).do
+- 2. Append MAC curves for multiple countries.do
+- 3. Append maps for multiple countries.do
+- 4. Display results for manuscript.do
+- 5. Sensitivity analysis 1-6.do
+- 6. Sensitivity analysis 7-10.do
+- 7. Sensitivity analysis generate and display results for manuscript (1-10).do
+- 8. Sensitivity analysis 11-12.do
+- 9. Sensitivity analysis generate and display results for manuscript (11-12).do

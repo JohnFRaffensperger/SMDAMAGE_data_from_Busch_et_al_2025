@@ -1,0 +1,38 @@
+Plan to take data from “Cost-effectiveness of natural forest regeneration and plantations for climate mitigation,” Busch et al, into SMDAMAGE
+
+DONE. 1. Create a database of their data.
+	Table Busch2024_undiscounted_dta_output
+    • Country, pixel id, genus, values A and k for best harvest type, 
+    • best harvest type: natural regeneration, native plantation, or exotic plantation.
+    • Y = harvest year or planning horizon, mapping to contract length.
+    • areaid  area in hectares,
+    • Bid cost per hectare: NPV(contract length Y, crop_va) + nr_cost + ep_cost + np_cost – p. Two of these will be zero.
+        ◦ crop_va: opportunity cost per hectare. I will convert this to an NPV at the start of the contract for the length of the contract, 
+		crop_va*∑Yu=0 (1 – discount_rate)u. SMDAMAGE will then discount it again from year t back to the 2026.
+        ◦ nr_cost: natural regeneration planting cost per hectare in 2020 USD,
+        ◦ np_cost: native plantation planting cost per hectare in 2020 USD,
+        ◦ ep_cost: exotic plantation planting cost per hectare in 2020 USD,
+        ◦ p: revenue from wood products (net of harvest and delivery costs) as a scalar of carbon at time of harvest. 
+		Must accrue only once for each contract? I guess the auction manager could buy a contract where the supplier repeatedly harvested the trees.
+	Table Busch2024_undiscounted_tC_per_h_year
+    • Carbon removal per hectare in each year 1, …, Y.
+
+DONE. 2. Given the above data, I want to categorize carbon removal per hectare into maybe 50 bins. Each bin has total Areap in millions of hectares.
+To do this binning, I need the full solution database. Then I will query it to categorize the carbon removal schedules.
+
+I used JFR code/2_k_means_carbon_removal.py to compress pixel-level carbon-removal schedules into forestry bidders for SMDAMAGE. 
+The k-means algorithm clustered pixels within each selected_rotation_year on year-by-year tC_per_ha_per_year profiles. 
+I then used JFR code/1_import_k_means_csv_to_sqlite.py to load those cluster centers and assignments into Output/Busch2024_to_SMDAMAGE.sqlite.
+The database stores the cluster centers in table carbon_removal_schedules and each pixel receives a cluster_index. 
+Next, I used JFR code/4_move_Busch_data_to_SMDAMAGE.py to export bidder metadata (forestry_bidder_metadata.csv) 
+and bidder-specific bid-step curves (forestry_bid_steps_long.csv) from per-pixel costs and areas. 
+In that export step, each (rotation_year, cluster_index) pair is one bidder, summed area becomes available_area_mhectares, 
+and bid steps are built by sorting per-pixel bid_cost_per_ha and accumulating area. 
+This keeps SMDAMAGE tractable while preserving heterogeneity in carbon timing, land availability, and costs.
+
+3. DONE. For each bin, I create a bid curve based on cost per hectare and area. 
+	Convert cost to $millions/million ha, and convert area to millions of hectares.
+	Function write_bid_steps_for_cluster exports bid curves for each (rotation_year, cluster_index).
+
+4. DONE. Next, export this data to the SMDAMAGE database. Build bidder-specific bid-step curves from per-pixel costs and areas.
+	Switch to the SMDAMAGE project for this.

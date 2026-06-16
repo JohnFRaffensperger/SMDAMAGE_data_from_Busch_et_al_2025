@@ -1,0 +1,13 @@
+{
+  "editor.detectIndentation": false,
+  "editor.insertSpaces": false,
+  "editor.tabSize": 4,
+  "editor.renderWhitespace": "boundary",
+  "python.terminal.activateEnvironment": false,
+  "[python]": {
+    "editor.insertSpaces": false,
+    "editor.tabSize": 4,
+    "editor.detectIndentation": false,
+    "editor.formatOnSave": false
+  }
+}

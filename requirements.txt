@@ -1,0 +1,7 @@
+# Core scientific/data dependencies used by active and legacy scripts
+numpy>=2.0,<3.0
+pandas>=2.2,<3.0
+openpyxl>=3.1,<4.0
+
+# Optional dependency: used by JFR code/Old/draw_outputs_graph.py if available
+scipy>=1.14,<2.0
