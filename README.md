@@ -10,7 +10,7 @@ This repository is not the official Busch et al. distribution site. Their public
 
 ## Publication
 
-Busch, J., Bukoski, J. J., Cook-Patton, S. C., Griscom, B., Kaczan, D., Potts, M. D., Yi, Y., and Vincent, J. R. (2024). Cost-effectiveness of natural forest regeneration and plantations for climate mitigation. Nature Climate Change, 14(9), 996-1002. https://doi.org/10.1038/s41558-024-02068-1. 
+Busch, J., Bukoski, J. J., Cook-Patton, S. C., Griscom, B., Kaczan, D., Potts, M. D., Yi, Y., and Vincent, J. R. (2024). Cost-effectiveness of natural forest regeneration and plantations for climate mitigation. Nature Climate Change, 14(9), 996-1002. https://doi.org/10.1038/s41558-024-02068-1.
 
 # Data
 
@@ -23,20 +23,11 @@ Their Zenodo record states that all data associated with the paper are publicly 
 I organize the top-level folders as follows:
 - `DO code/`: original and locally corrected Stata scripts.
 - `Input/`: country-level Busch `.dta` input files.
+- `Output/maps/`: original Busch `maps_*.dta` files
 - `JFR code/`: local Python utilities for export, inspection, clustering, and SQLite import.
-- `Output/`: derived outputs including SQLite databases and k-means CSV products.
-- `Output/Databases/Busch2024_dta_outputs.sqlite`: Stata-style output database used for inspection and validation
-- `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`: local SMDAMAGE-oriented export database
+- `Output/Databases/Busch2024_dta_outputs.sqlite`: Collected data from Busch's dta files.
 - `Output/Kmeans_temp_files/`: k-means centers, assignments, summary, and overall CSV files
-- `Output/20_exports_smdamage/`: long-format forestry exports
-- `Output/20_exports_smdamage/bidder_metadata/`: `forestry_bidder_metadata.csv`
-- `Output/20_exports_smdamage/bid_steps/`: `forestry_bid_steps_long.csv`
-- `Output/20_exports_smdamage/sequestration/`: reserved for `forestry_sequestration_long.csv`
-- `Output/20_exports_smdamage/pixel_costs/`: `forestry_bidder_pixel_costs.csv`
-- `Output/maps/`: `maps_*.dta` files
-- `Output/40_reports/`: report-style outputs such as `graph_of_variable_names.svg` and `mytable.html`
-- `Output/90_tmp/`: temporary files
-- `Output/99_archive/`: archived runs
+- `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`: processed Busch data ready for export to SMDAMAGE.
 
 Current scripts follow this structure:
 - `JFR code/1_k_means_carbon_removal.py` writes k-means CSV outputs to `Output/Kmeans_temp_files/`
@@ -188,21 +179,21 @@ Relevant scripts:
 - `JFR code/1_k_means_carbon_removal.py`
 - `JFR code/2_import_k_means_csv_to_sqlite.py`
 
-I used JFR code/1_k_means_carbon_removal.py to compress pixel-level carbon-removal schedules into forestry bidders for SMDAMAGE. 
-The k-means algorithm clustered pixels within each selected_rotation_year on year-by-year tC_per_ha_per_year profiles. 
+I used JFR code/1_k_means_carbon_removal.py to compress pixel-level carbon-removal schedules into forestry bidders for SMDAMAGE.
+The k-means algorithm clustered pixels within each selected_rotation_year on year-by-year tC_per_ha_per_year profiles.
 
 I then used JFR code/2_import_k_means_csv_to_sqlite.py to load those cluster centers and assignments into Output/Databases/Busch2024_to_SMDAMAGE.sqlite.
-The database stores the cluster centers in table carbon_removal_schedules and each pixel receives a cluster_index. 
+The database stores the cluster centers in table carbon_removal_schedules and each pixel receives a cluster_index.
 
-Next, I used JFR code/4_move_Busch_data_to_SMDAMAGE.py to export bidder metadata (forestry_bidder_metadata.csv) 
-and bidder-specific bid-step curves (forestry_bid_steps_long.csv) from per-pixel costs and areas. 
+Next, I used JFR code/4_move_Busch_data_to_SMDAMAGE.py to export bidder metadata (forestry_bidder_metadata.csv)
+and bidder-specific bid-step curves (forestry_bid_steps_long.csv) from per-pixel costs and areas.
 
-In that export step, each (rotation_year, cluster_index) pair is one bidder, summed area becomes available_area_mhectares, 
-and bid steps are built by sorting per-pixel bid_cost_per_ha and accumulating area. 
+In that export step, each (rotation_year, cluster_index) pair is one bidder, summed area becomes available_area_mhectares,
+and bid steps are built by sorting per-pixel bid_cost_per_ha and accumulating area.
 
 This keeps SMDAMAGE tractable while preserving heterogeneity in carbon timing, land availability, and costs.
 
-As of 2026-04-18, this clustered schedule import produced 71 forestry schedules distributed across rotation years 6, 10, 17, and 35, 
+As of 2026-04-18, this clustered schedule import produced 71 forestry schedules distributed across rotation years 6, 10, 17, and 35,
 and I used it to write schedule rows into `carbon_removal_schedules` and assign `cluster_index` values in `Undiscounted_dta_output`.
 
 ## Summary of the original `.do`-file issue
