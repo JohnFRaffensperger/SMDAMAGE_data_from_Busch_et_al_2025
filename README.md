@@ -8,13 +8,19 @@ This repository documents my use of the Busch et al dataset. I use this reposito
 
 This repository is not the official Busch et al. distribution site. Their publication and data depository are below.
 
-## Publication: Busch, J., Bukoski, J. J., Cook-Patton, S. C., Griscom, B., Kaczan, D., Potts, M. D., Yi, Y., and Vincent, J. R. (2024). Cost-effectiveness of natural forest regeneration and plantations for climate mitigation. Nature Climate Change, 14(9), 996-1002. https://doi.org/10.1038/s41558-024-02068-1. 
+## Publication
 
-# Data: Busch, J., Bukoski, J. J., Cook-Patton, S. C., Griscom, B., Kaczan, D., Potts, M. D., Yi, Y., and Vincent, J. R. (2024). Data for "Cost-effectiveness of natural forest regeneration and plantations for climate mitigation". Zenodo. https://doi.org/10.5281/zenodo.11372275. Zenodo record title: Data for "Cost-effectiveness of natural forest regeneration and plantations for climate mitigation".
+Busch, J., Bukoski, J. J., Cook-Patton, S. C., Griscom, B., Kaczan, D., Potts, M. D., Yi, Y., and Vincent, J. R. (2024). Cost-effectiveness of natural forest regeneration and plantations for climate mitigation. Nature Climate Change, 14(9), 996-1002. https://doi.org/10.1038/s41558-024-02068-1. 
+
+# Data
+
+Busch, J., Bukoski, J. J., Cook-Patton, S. C., Griscom, B., Kaczan, D., Potts, M. D., Yi, Y., and Vincent, J. R. (2024). Data for "Cost-effectiveness of natural forest regeneration and plantations for climate mitigation". Zenodo. https://doi.org/10.5281/zenodo.11372275. Zenodo record title: Data for "Cost-effectiveness of natural forest regeneration and plantations for climate mitigation".
 
 Their Zenodo record states that all data associated with the paper are publicly available there. Their record includes `00_readme_Busch2024.docx`, `08_input_dtas.zip`, `09_output_dtas.zip`, `10_sensitivity_dtas.zip`, and `12_stata_code.zip`. Their Zenodo dataset is published under CC BY 4.0. It shows a later version record, but I organize this repository around the local working files present here rather than trying to track every upstream revision automatically.
 
-## Repository scope. I organize the top-level folders as follows:
+## Repository scope
+
+I organize the top-level folders as follows:
 - `DO code/`: original and locally corrected Stata scripts.
 - `Input/`: country-level Busch `.dta` input files.
 - `JFR code/`: local Python utilities for export, inspection, clustering, and SQLite import.
@@ -38,7 +44,9 @@ Current scripts follow this structure:
 - `JFR code/4_move_Busch_data_to_SMDAMAGE.py` reads from `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`; its current `__main__` block is a placeholder (`pass`)
 - `JFR code/Old/draw_outputs_graph.py` writes `graph_of_variable_names.svg` to `Output/40_reports/`
 
-## Quick Start. From the repository root, run the core phase-one pipeline in this order:
+## Quick Start
+
+From the repository root, run the core phase-one pipeline in this order:
 1. Build/refresh the base export database: `python "JFR code/0_import_Busch2024_to_SMDAMAGE.py"`
 2. Build/refresh k-means schedules and assignments: `python "JFR code/1_k_means_carbon_removal.py"`
 3. Import k-means CSV outputs back into SQLite: `python "JFR code/2_import_k_means_csv_to_sqlite.py"`
@@ -46,7 +54,9 @@ Current scripts follow this structure:
 
 The code writes the primary data products to `Output/Databases/` and `Output/Kmeans_temp_files/`.
 
-## Reproducible Setup Entrypoint. This repository now has a single Python dependency entrypoint: `requirements.txt`.
+## Reproducible Setup Entrypoint
+
+This repository now has a single Python dependency entrypoint: `requirements.txt`.
 One-command setup option (recommended on Windows PowerShell): `./scripts/setup.ps1`
 
 From the repository root on Windows PowerShell:
@@ -66,7 +76,9 @@ The main local Python export lineage anchor is: `JFR code/0_import_Busch2024_to_
 
 I also keep a locally corrected Stata file here: `DO code/1. Model loop all data corrected.do`. I include that corrected file because I identified a likely soil-carbon bug in the original `.do` file, described below.
 
-## How I created `Busch2024_to_SMDAMAGE.sqlite`. This section documents the local workflow that I used to create the SMDAMAGE-style SQLite database.
+## How I created `Busch2024_to_SMDAMAGE.sqlite`
+
+This section documents the local workflow that I used to create the SMDAMAGE-style SQLite database.
 
 ### 1. Obtain the upstream Busch data
 
@@ -158,14 +170,18 @@ Important note:
 - the harvest revenue term is not a bare subtraction of `p`
 - it is `p` multiplied by harvested carbon per hectare
 
-### 5. Local run mode used in this repository. In this repository, I configure the export script to run all available country files from `Input/` and to write directly to `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`.
+### 5. Local run mode used in this repository
+
+In this repository, I configure the export script to run all available country files from `Input/` and to write directly to `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`.
 
 The relevant script settings are:
 - `RUN_ALL_PIXELS = True`
 - `SKIP_SQLITE_EXPORT = False`
 - inline settings that iterate all `.dta` files in `Input/`
 
-### 6. Post-export clustering work. After I created the SMDAMAGE-style SQLite database, I added a schedule-compression workflow to reduce the number of forestry schedules.
+### 6. Post-export clustering work
+
+After I created the SMDAMAGE-style SQLite database, I added a schedule-compression workflow to reduce the number of forestry schedules.
 
 Relevant scripts:
 - `JFR code/3_choose_harvest_years.py`
@@ -202,14 +218,18 @@ I interpret the original line as reusing the natural-regeneration soil-carbon in
 
 I preserve that local correction in: `DO code/1. Model loop all data corrected.do`
 
-## Note on correspondence with the authors. I raised this `.do`-file issue in correspondence with the Busch paper authors. This repository does not include private emails or a verbatim correspondence archive, so I limit the public summary to the following:
+## Note on correspondence with the authors
+
+I raised this `.do`-file issue in correspondence with the Busch paper authors. This repository does not include private emails or a verbatim correspondence archive, so I limit the public summary to the following:
 - I identified a likely soil-carbon issue in the original Stata code
 - the issue concerns the use of `nrsoil` versus `plantsoil` in the with-harvest soil-carbon loop
 - I preserve a locally corrected `.do` file reflecting that change
 
 If I later add a fuller correspondence record to the repository, I should update this section to cite that record directly.
 
-## Plan for bringing the data into SMDAMAGE. This section summarizes my current working state in this repository as of phase one.
+## Plan for bringing the data into SMDAMAGE
+
+This section summarizes my current working state in this repository as of phase one.
 
 Current status from my latest workflow notes:
 1. DONE: create the Busch SQLite export with pixel-level economics and annual carbon schedules.
@@ -231,7 +251,9 @@ In short, my intended SMDAMAGE integration path is:
 4. refactor SMDAMAGE input loading to support those long-format forestry tables
 5. replace the aggregate forestry land constraint with bidder-specific land caps
 
-## Reproducibility notes. I use this repository as a working research repository rather than as a polished upstream software package. Reproducibility depends on keeping several lineage distinctions clear.
+## Reproducibility notes
+
+I use this repository as a working research repository rather than as a polished upstream software package. Reproducibility depends on keeping several lineage distinctions clear.
 
 - `Busch2024_dta_outputs.sqlite` and `Busch2024_to_SMDAMAGE.sqlite` are different databases with different purposes
 - the Stata `.do` files remain the methodological anchor for Busch et al. (2024)
@@ -239,7 +261,9 @@ In short, my intended SMDAMAGE integration path is:
 - Claude wrote or helped write some of my local Python utilities, but I used those utilities to implement and inspect the Busch et al. logic rather than to redefine it
 - my local corrections and downstream integration steps need explicit documentation because they are not part of the original Busch et al. release by default
 
-## Recommended citation practice. If you use this repository for methodology or downstream integration, I recommend citing both the Busch et al. (2024) paper and the public Zenodo data deposit:
+## Recommended citation practice
+
+If you use this repository for methodology or downstream integration, I recommend citing both the Busch et al. (2024) paper and the public Zenodo data deposit:
 
 - Paper: https://doi.org/10.1038/s41558-024-02068-1
 - Data: https://doi.org/10.5281/zenodo.11372275
