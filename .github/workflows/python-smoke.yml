@@ -24,7 +24,8 @@ jobs:
 
       - name: Syntax check active scripts
         run: |
-          python -m py_compile "JFR code/1_k_means_carbon_removal.py"
-          python -m py_compile "JFR code/2_import_k_means_csv_to_sqlite.py"
-          python -m py_compile "JFR code/3_choose_harvest_years.py"
+          python -m py_compile "JFR code/0_choose_harvest_years.py"
+          python -m py_compile "JFR code/1_import_Busch2024_to_SMDAMAGE.py"
+          python -m py_compile "JFR code/2_k_means_carbon_removal.py"
+          python -m py_compile "JFR code/3_import_k_means_csv_to_sqlite.py"
           python -m py_compile "JFR code/4_move_Busch_data_to_SMDAMAGE.py"

@@ -1,6 +1,15 @@
 # 0_choose_harvest_years.py | Made by Claude guided by JFR | Created 2026-04-15
-# Chooses representative harvest years using Faustmann-rule clustering, then writes a mapping table for simplified,
-# financially consistent downstream rotation-year bucketing choices.
+# Chooses representative harvest years using Faustmann-rule clustering, 
+# then writes a mapping table for simplified financially consistent downstream rotation-year bucketing choices.
+
+# On setting minimum_harvest_year: This parameter excludes candidate years below the minimum from the dynamic program.
+# The code will draw no bucket representative from that range and the output CSV will contain no mapping for those years.
+# I changed it from 3 to 30 ("we do not accept contracts under 30 years"). The SMDAMAGE auction tends to reject short contracts as uneconomic
+# because the temperature goal favors longer periods of carbon removal. 
+# In one full set of runs, it accepted contracts of only 35 years, which were the maximum length in that run.
+# A database rebuilt with minimum_harvest_year=30 would exclude them without a full re-run.
+# The HARVEST_YEAR_BUCKETS dict in 1_import_Busch2024_to_SMDAMAGE.py was derived from a prior run with minimum=3.
+
 from __future__ import annotations
 import csv
 from dataclasses import dataclass
@@ -11,10 +20,10 @@ DEFAULT_OUTPUT_CSV = OUTPUT_DIR / "choose_harvest_years_mapping.csv"
 
 @dataclass(slots=True)
 class RunConfig:
-	k: int = 6
-	maximum_harvest_year: int = 50
-	minimum_harvest_year: int = 3
-	discount_rate: float = 0.05
+	k: int = 6 # A larger value means many more variables in SMDAMAGE.
+	maximum_harvest_year: int = 120 # First round of SMDAMAGE: 50
+	minimum_harvest_year: int = 30 # First round of SMDAMAGE: 3. But the SMDAMAGE market rejects short contracts. 
+	discount_rate: float = 0.03 # First round of SMDAMAGE: 0.05, used in Busch's paper. The main scenario is SMDAMAGE uses 0.03. Lowering discount_rate tends to produce longer growing periods, i.e., longer contracts for carbon removal.
 	include_sentinel: bool = True
 	output_csv: Path = DEFAULT_OUTPUT_CSV
 
