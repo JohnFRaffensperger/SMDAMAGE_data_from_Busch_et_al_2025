@@ -1,4 +1,4 @@
-# 1_k_means_carbon_removal.py | Made by Claude guided by JFR | Created 2026-04-15
+# 2_k_means_carbon_removal.py | Made by Claude guided by JFR | Created 2026-04-15
 # Loads one rotation year's pixel carbon-removal profiles, evaluates multiple full k-means schedule sizes, and optionally writes comparison outputs to CSV.
 from __future__ import annotations
 import csv

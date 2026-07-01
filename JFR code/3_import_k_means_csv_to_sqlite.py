@@ -1,4 +1,4 @@
-# 2_import_k_means_csv_to_sqlite.py | Made by Claude guided by JFR | Created 2026-04-18
+# 3_import_k_means_csv_to_sqlite.py | Made by Claude guided by JFR | Created 2026-04-18
 # Imports completed k-means CSV outputs into Busch2024_to_SMDAMAGE.sqlite, populating carbon_removal_schedules and pixel cluster assignments.
 from __future__ import annotations
 import csv

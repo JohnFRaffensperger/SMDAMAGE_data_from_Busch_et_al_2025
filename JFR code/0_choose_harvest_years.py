@@ -1,5 +1,5 @@
-# 3_choose_harvest_years.py | Made by Claude guided by JFR | Created 2026-04-15
-# Chooses representative harvest years using Faustmann-rule clustering, then writes a mapping table for simplified, 
+# 0_choose_harvest_years.py | Made by Claude guided by JFR | Created 2026-04-15
+# Chooses representative harvest years using Faustmann-rule clustering, then writes a mapping table for simplified,
 # financially consistent downstream rotation-year bucketing choices.
 from __future__ import annotations
 import csv
@@ -40,6 +40,12 @@ def build_candidate_years(minimum_harvest_year: int, maximum_harvest_year: int, 
 	return years
 
 def precompute_segment_costs(years: list[int], values: list[float]) -> tuple[list[list[float]], list[list[int]]]:
+	# For every contiguous segment [start..stop] of the years list, find:
+	#   - costs[start][stop]: the minimum sum-of-squared-errors achievable by
+	#     picking exactly one representative year from within the segment, and
+	#   - representatives[start][stop]: the index of that best representative.
+	# A representative year r minimises sum_{i=start}^{stop} (values[i] - values[r])^2.
+	# This is O(n^3) pre-work that makes the k-segment DP in choose_harvest_years O(k*n^2).
 	n = len(years)
 	costs = [[0.0]*n for _ in range(n)]
 	representatives = [[0]*n for _ in range(n)]
@@ -47,12 +53,12 @@ def precompute_segment_costs(years: list[int], values: list[float]) -> tuple[lis
 		for stop in range(start, n):
 			best_cost = float("inf")
 			best_rep = start
-			for rep in range(start, stop + 1):
+			for rep in range(start, stop + 1):  # Try each year in the segment as the representative.
 				rep_value = values[rep]
 				cost = 0.0
 				for index in range(start, stop + 1):
 					delta = values[index] - rep_value
-					cost += delta*delta
+					cost += delta*delta  # Squared error between each year's value and the representative.
 				if cost < best_cost:
 					best_cost = cost
 					best_rep = rep
@@ -61,6 +67,18 @@ def precompute_segment_costs(years: list[int], values: list[float]) -> tuple[lis
 	return costs, representatives
 
 def choose_harvest_years(k: int, maximum_harvest_year: int, minimum_harvest_year: int = 3, discount_rate: float = 0.05, include_sentinel: bool = True) -> tuple[list[int], list[dict[str, float | int]], float]:
+	# Partition the candidate harvest years into exactly k contiguous segments so that
+	# the total sum-of-squared-errors between each year's Faustmann hurdle and its
+	# segment's representative is minimised.  Each segment's representative becomes one
+	# chosen rotation year used in SMDAMAGE; every original year maps to that chosen year.
+	#
+	# The Faustmann hurdle r/(1-(1+r)^{-(T-1)}) is the minimum required annual return
+	# for rotation T to be optimal at discount rate r. Years with similar hurdles are
+	# financially interchangeable, so they belong in the same segment.
+	#
+	# Algorithm: standard optimal k-segment partition DP (Bellman 1961).
+	#   dp[c][j] = minimum total SSE using exactly c segments covering years[0..j].
+	#   prev[c][j] = last index before the final segment starts (for backtracking).
 	years = build_candidate_years(minimum_harvest_year, maximum_harvest_year, include_sentinel)
 	if k <= 0: raise ValueError("k must be positive.")
 	if k > len(years): raise ValueError("k cannot exceed the number of candidate harvest years.")
@@ -69,15 +87,16 @@ def choose_harvest_years(k: int, maximum_harvest_year: int, minimum_harvest_year
 	n = len(years)
 	dp = [[float("inf")]*n for _ in range(k + 1)]
 	prev = [[-1]*n for _ in range(k + 1)]
-	for stop in range(n):
+	for stop in range(n):  # Base case: one segment covering years[0..stop].
 		dp[1][stop] = costs[0][stop]
 	for clusters in range(2, k + 1):
 		for stop in range(clusters - 1, n):
-			for split in range(clusters - 2, stop):
+			for split in range(clusters - 2, stop):  # The (clusters-1)-th segment ends at split; the last segment is [split+1..stop].
 				candidate_cost = dp[clusters - 1][split] + costs[split + 1][stop]
 				if candidate_cost < dp[clusters][stop]:
 					dp[clusters][stop] = candidate_cost
-					prev[clusters][stop] = split
+					prev[clusters][stop] = split  # Remember the split point for backtracking.
+	# Backtrack from dp[k][n-1] to recover the k segment boundaries.
 	segments = []
 	clusters = k
 	stop = n - 1
@@ -86,11 +105,12 @@ def choose_harvest_years(k: int, maximum_harvest_year: int, minimum_harvest_year
 		segments.append((start, stop))
 		stop = prev[clusters][stop]
 		clusters -= 1
-	segments.reverse()
+	segments.reverse()  # Backtracking yields segments in reverse order.
+	# Build output: for each segment, record which chosen year every original year maps to.
 	chosen_years = []
 	mapping_rows = []
 	for start, stop in segments:
-		rep_index = representatives[start][stop]
+		rep_index = representatives[start][stop]  # Index of the best representative within this segment.
 		chosen_year = years[rep_index]
 		chosen_years.append(chosen_year)
 		chosen_value = values[rep_index]
