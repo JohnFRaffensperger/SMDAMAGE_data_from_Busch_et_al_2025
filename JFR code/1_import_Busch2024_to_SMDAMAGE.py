@@ -3,6 +3,8 @@
 
 # With CoPilot, I converted "1. Model loop all data corrected.do" to Python and heavily modified it with additions for NPV costing, 
 # rotation bucketing, and the full Busch-to-SMDAMAGE pipeline.
+# This is fiddly code, hard to get done in one pass. I pressed Copilot to improve the speed and avoid memory errors.
+# It will take several hours.
 
 # Output: Output/Databases/Busch2024_to_SMDAMAGE.sqlite, two tables:
 #   Undiscounted_dta_output — one row per pixel: country, pixel_id, plantation_genus,
@@ -91,6 +93,7 @@ HARVEST_C_POOL = 1
 SMALL_DTA_COUNT = 50
 SKIP_SQLITE_EXPORT = False
 HARVEST_YEAR_BUCKETS_CSV = Path(__file__).resolve().parent.parent / "Output" / "choose_harvest_years_mapping.csv"
+RESUME_AFTER_ISO = "KAZ"
 
 AFRI = {"DZA", "AGO", "BEN", "BWA", "BFA", "BDI", "CPV", "CMR", "CAF", "TCD", "COM", "COG", "CIV", "COD", "DJI", "EGY", "GNQ",
 	"ERI", "SWZ", "ETH", "GAB", "GMB", "GHA", "GIN", "GNB", "KEN", "LSO", "LBR", "LBY", "MDG", "MWI", "MDV", "MLI", "MRT", "MUS",
@@ -328,15 +331,21 @@ def process_country(iso: str, dta_dir: Path, macc_dir: Path) -> dict[str, int]:
 	# Vectorized annual carbon schedules: nr_annual and pl_annual are (N, T) float32 arrays.
 	# Replaces 360 per-year DataFrame columns and ~840 sequential pandas loop iterations.
 	N = len(df); T = Years_time_horizon
-	years_arr = np.arange(1, T + 1, dtype=np.float64)
-	k_nr  = df["nr_k"].to_numpy()[:, None]
-	A_nr  = df["nr_A"].to_numpy()[:, None]
-	rs_nr = df["nr_rootshoot"].to_numpy()[:, None]
-	nr_cum_2d = ((AGB_C_POOL + BGB_C_POOL*rs_nr)*A_nr*(1 - np.exp(-k_nr*years_arr))**2
-	             + SOIL_C_POOL*years_arr*(NATURAL_SOIL_C + PLANTATION_SOIL_C))
+	years_arr = np.arange(1, T + 1, dtype=np.float32)
+	k_nr  = df["nr_k"].to_numpy(dtype=np.float32)
+	A_nr  = df["nr_A"].to_numpy(dtype=np.float32)
+	rs_nr = df["nr_rootshoot"].to_numpy(dtype=np.float32)
 	nr_annual = np.empty((N, T), dtype=np.float32)
-	nr_annual[:, 0] = nr_cum_2d[:, 0]
-	nr_annual[:, 1:] = np.diff(nr_cum_2d, axis=1)
+	nr_chunk_rows = 120_000
+	for i0 in range(0, N, nr_chunk_rows):
+		i1 = min(i0 + nr_chunk_rows, N)
+		k_ch = k_nr[i0:i1, None]
+		A_ch = A_nr[i0:i1, None]
+		rs_ch = rs_nr[i0:i1, None]
+		nr_cum_ch = ((AGB_C_POOL + BGB_C_POOL*rs_ch)*A_ch*(1 - np.exp(-k_ch*years_arr))**2
+		             + SOIL_C_POOL*years_arr*(NATURAL_SOIL_C + PLANTATION_SOIL_C)).astype(np.float32, copy=False)
+		nr_annual[i0:i1, 0] = nr_cum_ch[:, 0]
+		nr_annual[i0:i1, 1:] = np.diff(nr_cum_ch, axis=1)
 	np.nan_to_num(nr_annual, copy=False, nan=0.0)
 	pl_annual = np.zeros((N, T), dtype=np.float32)  # filled per genus below
 	new_columns: dict[str, np.ndarray] = {}
@@ -361,7 +370,7 @@ def process_country(iso: str, dta_dir: Path, macc_dir: Path) -> dict[str, int]:
 	# Discounted present value of establishment costs.
 	if "crop_va" not in df.columns: df["crop_va"] = 0.0
 
-	for g in GENUS_ORDER:  # Vectorized: all pixels in genus g × all years simultaneously.
+	for g in GENUS_ORDER:  # Chunked vectorization: genus-wide, but processed in row blocks.
 		mask = df["genus"] == g
 		if not mask.any(): continue
 		g_A_s = df.loc[mask, f"{g}_A"]
@@ -371,28 +380,46 @@ def process_country(iso: str, dta_dir: Path, macc_dir: Path) -> dict[str, int]:
 		elif g == "cunn": g_npv_init = (df.loc[mask, "np_cost"] if iso == "CHN" else df.loc[mask, "ep_cost"]).to_numpy()
 		elif g == "euca": g_npv_init = df.loc[mask, "ep_cost"].to_numpy()
 		else: g_npv_init = (df.loc[mask, "exotic"]*df.loc[mask, "ep_cost"] + df.loc[mask, "native"]*df.loc[mask, "np_cost"]).to_numpy()
-		A_g = g_A_s.to_numpy()[:, None]; k_g = g_k_s.to_numpy()[:, None]
-		hy  = g_harvestyear.to_numpy().astype(float)[:, None]  # ≥ 30 after floor clamping
-		yr  = years_arr[None, :]
-		yr_mod     = np.mod(yr, hy)                                  # resets to 0 at harvest years
-		harvest    = (yr_mod == 0)                                   # True when yr divisible by hy
-		g_stock_2d = A_g * (1 - np.exp(-k_g * yr_mod))**2           # standing stock each year
-		harv_c     = A_g * (1 - np.exp(-k_g * yr))**2 * harvest     # carbon removed at harvest
-		g_harv_2d  = np.cumsum(harv_c, axis=1)
-		g_soil_2d  = PLANTATION_SOIL_C * np.minimum(np.maximum(hy - 1, 0.0), yr)
-		pl_rs = df.loc[mask, "pl_rootshoot"].to_numpy()[:, None]
-		w_g   = df.loc[mask, "w"].to_numpy()[:, None]
-		g_cum_2d = g_stock_2d + g_stock_2d*pl_rs + g_soil_2d + w_g*g_harv_2d
-		pl_g = np.empty_like(g_cum_2d, dtype=np.float32)
-		pl_g[:, 0] = g_cum_2d[:, 0]; pl_g[:, 1:] = np.diff(g_cum_2d, axis=1)
-		np.nan_to_num(pl_g, copy=False, nan=0.0)
-		pl_annual[mask.to_numpy(), :] = pl_g
+		rows = np.flatnonzero(mask.to_numpy())
+		A1d = g_A_s.to_numpy(dtype=np.float32)
+		k1d = g_k_s.to_numpy(dtype=np.float32)
+		hy1d = g_harvestyear.to_numpy(dtype=np.float32)
+		rs1d = df.loc[mask, "pl_rootshoot"].to_numpy(dtype=np.float32)
+		w1d = df.loc[mask, "w"].to_numpy(dtype=np.float32)
+		g_sf = np.empty(len(rows), dtype=np.float32)
+		g_hf = np.empty(len(rows), dtype=np.float32)
+		harvest_counts = np.empty(len(rows), dtype=np.int16)
+		yr = years_arr[None, :]
+		chunk_rows = 100_000
+		for c0 in range(0, len(rows), chunk_rows):
+			c1 = min(c0 + chunk_rows, len(rows))
+			A_ch = A1d[c0:c1, None]
+			k_ch = k1d[c0:c1, None]
+			hy_ch = hy1d[c0:c1, None]
+			rs_ch = rs1d[c0:c1, None]
+			w_ch = w1d[c0:c1, None]
+			yr_mod = np.mod(yr, hy_ch)
+			harvest = (yr_mod == 0)
+			g_stock_2d = (A_ch*(1 - np.exp(-k_ch*yr_mod))**2).astype(np.float32, copy=False)
+			harv_c = (A_ch*(1 - np.exp(-k_ch*yr))**2).astype(np.float32, copy=False)
+			harv_c *= harvest
+			np.cumsum(harv_c, axis=1, out=harv_c)
+			g_soil_2d = (PLANTATION_SOIL_C*np.minimum(np.maximum(hy_ch - 1.0, 0.0), yr)).astype(np.float32, copy=False)
+			g_cum_2d = g_stock_2d
+			g_cum_2d *= (1.0 + rs_ch)
+			g_cum_2d += g_soil_2d
+			g_cum_2d += w_ch*harv_c
+			pl_g = np.empty_like(g_cum_2d, dtype=np.float32)
+			pl_g[:, 0] = g_cum_2d[:, 0]
+			pl_g[:, 1:] = np.diff(g_cum_2d, axis=1)
+			np.nan_to_num(pl_g, copy=False, nan=0.0)
+			pl_annual[rows[c0:c1], :] = pl_g
+			g_sf[c0:c1] = g_stock_2d[:, -1]
+			g_hf[c0:c1] = harv_c[:, -1]
+			harvest_counts[c0:c1] = harvest.sum(axis=1).astype(np.int16, copy=False)
 		# Scalar fields for cost-effectiveness (final-year values).
-		g_sf  = g_stock_2d[:, -1]; g_hf = g_harv_2d[:, -1]
-		g_sf_soil = PLANTATION_SOIL_C * np.minimum(np.maximum(hy.ravel() - 1, 0.0), float(T))
-		g_npv_f   = g_npv_init * (2.0 ** harvest.sum(axis=1))  # doubles at each harvest event
-		rs1d = df.loc[mask, "pl_rootshoot"].to_numpy(); w1d = df.loc[mask, "w"].to_numpy()
-		A1d = g_A_s.to_numpy(); k1d = g_k_s.to_numpy()
+		g_sf_soil = PLANTATION_SOIL_C * np.minimum(np.maximum(hy1d - 1.0, 0.0), float(T))
+		g_npv_f = g_npv_init * (2.0 ** harvest_counts)
 		g_wohrv_total = (AGB_C_POOL*A1d*(1 - np.exp(-k1d*T))**2
 		               + BGB_C_POOL*(A1d*(1 - np.exp(-k1d*T))**2)*rs1d + SOIL_C_POOL*T*PLANTATION_SOIL_C)
 		g_whrv_total  = (AGB_C_POOL*g_sf + BGB_C_POOL*g_sf*rs1d + SOIL_C_POOL*g_sf_soil + HARVEST_C_POOL*w1d*g_hf)
@@ -423,11 +450,10 @@ def process_country(iso: str, dta_dir: Path, macc_dir: Path) -> dict[str, int]:
 	# Generate minimum output columns (keep only whrv scenario for MACC).
 	df.loc[:, "mi_whrv_total_tC_per_ha"] = np.where(df["refortype_whrv_tCO2_per_USD"] == "P", df["pl_whrv_total_tC_per_ha"], np.where(df["refortype_whrv_tCO2_per_USD"] == "N", df["nr_wohrv_total_tC_per_ha"], 0))
 	df.loc[:, "mi_whrv_costeff_USD_per_tCO2"] = np.where(df["refortype_whrv_tCO2_per_USD"] == "P", df["pl_whrv_costeff_USD_per_tCO2"], np.where(df["refortype_whrv_tCO2_per_USD"] == "N", df["nr_wohrv_costeff_USD_per_tCO2"], np.nan))
-	
-	# Build mi_annual from numpy arrays (no per-year DataFrame columns needed).
-	is_P = (df["refortype_whrv_tCO2_per_USD"].to_numpy() == "P")[:, None]
-	is_N = (df["refortype_whrv_tCO2_per_USD"].to_numpy() == "N")[:, None]
-	mi_annual = np.where(is_P, pl_annual, np.where(is_N, nr_annual, 0.0)).astype(np.float32)
+
+	# Avoid allocating a third full (N,T) matrix for mi_annual on very large countries.
+	is_P_1d = (df["refortype_whrv_tCO2_per_USD"].to_numpy() == "P")
+	is_N_1d = (df["refortype_whrv_tCO2_per_USD"].to_numpy() == "N")
 
 	# SMDAMAGE doesn't need the MACC curves, so I've omitted this code.
 	# Print all columns as one item/value per row.
@@ -465,19 +491,12 @@ def process_country(iso: str, dta_dir: Path, macc_dir: Path) -> dict[str, int]:
 	selected_rotation_year = np.where(df["refortype_whrv_tCO2_per_USD"] == "P", df["selected_plantation_rotation_year"], np.where(df["refortype_whrv_tCO2_per_USD"] == "N", float(Years_time_horizon), np.nan))
 	macc_dir.mkdir(parents=True, exist_ok=True)
 
-	smdamage_export = pd.DataFrame({
-		"country": iso,
-		"pixel_id": df["id"],
-		"plantation_genus": df["genus"],
-		"selected_option": selected_option,
+	smdamage_export = pd.DataFrame({"country": iso, "pixel_id": df["id"], "plantation_genus": df["genus"], "selected_option": selected_option,
 		"selected_A": np.where(df["refortype_whrv_tCO2_per_USD"] == "P", df["genus_A"], np.where(df["refortype_whrv_tCO2_per_USD"] == "N", df["nr_A"], np.nan)),
 		"selected_k": np.where(df["refortype_whrv_tCO2_per_USD"] == "P", df["genus_k"], np.where(df["refortype_whrv_tCO2_per_USD"] == "N", df["nr_k"], np.nan)),
-		"selected_rotation_year": selected_rotation_year,
-		"area_ha": df["area_ha"],
-		"crop_va_USD_per_ha_per_year": df["crop_va"],
+		"selected_rotation_year": selected_rotation_year, "area_ha": df["area_ha"], "crop_va_USD_per_ha_per_year": df["crop_va"],
 		"selected_establishment_cost_USD_per_ha": np.where(df["refortype_whrv_tCO2_per_USD"] == "P", df["pl_npv_estcost_USD_per_ha"], np.where(df["refortype_whrv_tCO2_per_USD"] == "N", df["nr_cost"], np.nan)),
-		"p_USD_per_tC_harvested": np.where(df["refortype_whrv_tCO2_per_USD"] == "P", df["p"], 0.0),
-	})
+		"p_USD_per_tC_harvested": np.where(df["refortype_whrv_tCO2_per_USD"] == "P", df["p"], 0.0),})
 	if SKIP_SQLITE_EXPORT: print(f"[SKIP_SQLITE_EXPORT] {iso}", flush=True)
 	else:
 		db_path = macc_dir / SMDAMAGE_DB_FILE
@@ -494,9 +513,13 @@ def process_country(iso: str, dta_dir: Path, macc_dir: Path) -> dict[str, int]:
 				year = yr_idx + 1
 				ym = sel_rot >= float(year)
 				if not ym.any(): continue
+				p_mask = is_P_1d[ym]
+				n_mask = is_N_1d[ym]
+				vals = nr_annual[ym, yr_idx].copy()
+				vals[p_mask] = pl_annual[ym, yr_idx][p_mask]
+				vals[~(p_mask | n_mask)] = 0.0
 				pids = pixel_ids_arr[ym].tolist()   # one C-level numpy→Python call, not per-row Python
-				vals = mi_annual[ym, yr_idx].tolist()
-				conn.executemany(insert_sql, zip([iso]*len(pids), pids, [year]*len(pids), vals))
+				conn.executemany(insert_sql, zip([iso]*len(pids), pids, [year]*len(pids), vals.tolist()))
 
 	# Show carbon buckets.
 	# total_C_categories = {}
@@ -525,50 +548,32 @@ def main() -> None:
 
 if __name__ == "__main__":
 	# Set this to True to run all countries from in-script settings (no CLI args).
-	RUN_WITH_INLINE_SETTINGS = True
-	if RUN_WITH_INLINE_SETTINGS:
-		base_dir = Path(__file__).resolve().parent.parent  # Busch2024/
-		db_dir = base_dir / "Output" / "Databases"  # matches DEFAULT_DB_FILE in 2_k_means_carbon_removal.py
-		db_path = db_dir / SMDAMAGE_DB_FILE
-		# Resume support: check which countries are fully written (max year in year table
-		# matches max rotation year in pixel table — incomplete runs are excluded).
-		done_isos: set[str] = set()
-		if db_path.exists():
-			try:
-				with sqlite3.connect(db_path) as _c:
-					done_isos = {row[0] for row in _c.execute(f"""
-						SELECT p.country FROM
-							(SELECT country, MAX(CAST(selected_rotation_year AS INTEGER)) AS max_rot
-							 FROM {SMDAMAGE_PIXEL_TABLE} WHERE selected_rotation_year IS NOT NULL GROUP BY country) p
-						JOIN
-							(SELECT country, MAX(year) AS max_year
-							 FROM {SMDAMAGE_YEAR_TABLE} GROUP BY country) y
-						ON p.country = y.country AND y.max_year >= p.max_rot""")}
-			except sqlite3.OperationalError:
-				pass  # table doesn't exist yet
-		if done_isos:
-			print(f"Resuming: {len(done_isos)} countries already done. Delete {db_path.name} to restart from scratch.", flush=True)
-		else:
-			initialize_smdamage_database(db_dir)
-		requested_isos = iter_smallest_input_isos(base_dir / "Input", 999)  # all countries, smallest .dta file first
-		all_blank_counts: dict[str, dict[str, int]] = {}
-		for iso in requested_isos:
-			if iso in done_isos:
-				print(f"[SKIP] {iso} already in database", flush=True)
-				continue
-			dta_dir = base_dir / "Input"
-			src = next((c for c in [dta_dir / iso, dta_dir / f"{iso}.dta", dta_dir / f"maps_{iso}.dta"] if c.exists() and c.is_file()), None)
-			size_mb = src.stat().st_size / 1e6 if src else 0
-			t0 = time.perf_counter()
-			all_blank_counts[iso] = process_country(iso=iso, dta_dir=dta_dir, macc_dir=db_dir)
-			elapsed = time.perf_counter() - t0
-			print(f"  {elapsed:.1f}s / {size_mb:.1f} MB = {elapsed/size_mb:.2f} s/MB", flush=True)
-		# Build the year-table index once after all inserts — far faster than maintaining it per-row.
-		print("Building year table index...", flush=True)
-		with sqlite3.connect(db_path) as _c:
-			_c.execute("PRAGMA synchronous = OFF")
-			_c.execute(f"CREATE INDEX IF NOT EXISTS idx_{SMDAMAGE_YEAR_TABLE}_country_pixel_year ON {SMDAMAGE_YEAR_TABLE} (country, pixel_id, year)")
-		print("Index built.", flush=True)
-		# print(f"[MI_COUNTS_SUMMARY] {all_blank_counts}", flush=True)
+	
+	base_dir = Path(__file__).resolve().parent.parent  # Busch2024/
+	db_dir = base_dir / "Output" / "Databases"  # matches DEFAULT_DB_FILE in 2_k_means_carbon_removal.py
+	db_path = db_dir / SMDAMAGE_DB_FILE
+	dta_dir = base_dir / "Input"
+	cutoff_src = next((c for c in [dta_dir / RESUME_AFTER_ISO, dta_dir / f"{RESUME_AFTER_ISO}.dta", dta_dir / f"maps_{RESUME_AFTER_ISO}.dta"] if c.exists() and c.is_file()), None)
+	if cutoff_src is None: raise FileNotFoundError(f"{RESUME_AFTER_ISO} input file not found in {dta_dir}")
+	cutoff_size = cutoff_src.stat().st_size
+	requested_isos = [path.stem.upper() for path in sorted((path for path in dta_dir.glob("*.dta") if path.is_file() and path.stat().st_size > cutoff_size), key=lambda path: (path.stat().st_size, path.stem.upper()))]
+	if db_path.exists(): print(f"Resume mode: assuming all countries up to {RESUME_AFTER_ISO} ({cutoff_size/1e6:.1f} MB) are complete; skipping DB completeness checks.", flush=True)
 	else:
-		main()
+		print(f"No existing {db_path.name}; creating a fresh database.", flush=True)
+		initialize_smdamage_database(db_dir)
+	print(f"Processing {len(requested_isos)} countries with .dta size > {RESUME_AFTER_ISO}.", flush=True)
+	all_blank_counts: dict[str, dict[str, int]] = {}
+	for iso in requested_isos:
+		src = next((c for c in [dta_dir / iso, dta_dir / f"{iso}.dta", dta_dir / f"maps_{iso}.dta"] if c.exists() and c.is_file()), None)
+		size_mb = src.stat().st_size / 1e6 if src else 0
+		t0 = time.perf_counter()
+		all_blank_counts[iso] = process_country(iso=iso, dta_dir=dta_dir, macc_dir=db_dir)
+		elapsed = time.perf_counter() - t0
+		print(f"  {elapsed:.1f}s / {size_mb:.1f} MB = {elapsed/size_mb:.2f} s/MB", flush=True)
+	
+	print("Building year table index...", flush=True)
+	with sqlite3.connect(db_path) as _c:
+		_c.execute("PRAGMA synchronous = OFF")
+		_c.execute(f"CREATE INDEX IF NOT EXISTS idx_{SMDAMAGE_YEAR_TABLE}_country_pixel_year ON {SMDAMAGE_YEAR_TABLE} (country, pixel_id, year)")
+	print("Index built.", flush=True)
+	# print(f"[MI_COUNTS_SUMMARY] {all_blank_counts}", flush=True)
