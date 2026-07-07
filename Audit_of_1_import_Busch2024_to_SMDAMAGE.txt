@@ -1,0 +1,394 @@
+Audit of 1_import_Busch2024_to_SMDAMAGE.py vs. 1. Model loop all data corrected.do, 2026-07-03
+
+I asked Claude Sonnet: Create a text file "Audit_of_1_import_Busch2024_to_SMDAMAGE.txt". Conduct a thorough audit of 1_import_Busch2024_to_SMDAMAGE.py,
+comparing it to the original "1. Model loop all data corrected.do". Check all documentation throughout the project. 
+You should find that the Python code uses a different discount rate and contains a documented correction to the ".do" code. 
+The Python code also omits the MACC calculations, because those are not needed for the SMDAMAGE work flow. Besides those, 
+compare examine the calculations. What is different about them? To improve their fidelity, what lines of code in the Python 
+should change and why? Be especially careful around discounting and harvest years. 
+The Python code has different harvest year calculations; document those. -- JFR
+===========================================================
+
+PURPOSE OF THIS DOCUMENT
+This audit compares the Python pipeline (JFR code/1_import_Busch2024_to_SMDAMAGE.py)
+against the Stata source of truth (DO code/1. Model loop all data corrected.do). It
+documents all intentional design differences, mathematical divergences, and suggested
+corrections, with exact line-level references to both files.
+
+
+SECTION 1 — INTENTIONAL DIFFERENCES (NOT BUGS)
+-------------------------------------------------------
+
+1.1  MACC calculations omitted
+Stata: builds marginal-abatement-cost curves using per-cell carbon and area, sorts by
+cost-effectiveness, and writes MACC_<ISO>.csv files. This is the primary output of the
+Stata workflow.
+Python: all MACC-curve code is present in the file but commented out (lines ~490-510).
+Reason documented in the Python header: SMDAMAGE does not need MAC curves; it needs
+per-pixel carbon schedules and bid costs instead.
+Assessment: correct and intentional.
+
+1.2  Output target is SQLite, not .dta
+Stata: saves per-country maps_<ISO>.dta files and MACC_<ISO>.csv files.
+Python: writes all output to Busch2024_to_SMDAMAGE.sqlite, tables
+Undiscounted_dta_output (one row per pixel) and tC_per_h_per_year (one row per
+pixel-year). This is the data bridge into the SMDAMAGE auction pipeline.
+Assessment: intentional design difference documented in the Python header.
+
+1.3  Year-by-year undiscounted carbon schedules are a new output
+Stata: has no per-year per-pixel export. It accumulates discounted totals.
+Python: builds the (N x T) arrays nr_annual and pl_annual containing undiscounted
+annual increments and writes them row-by-row to tC_per_h_per_year. This is the input
+that downstream scripts use for k-means clustering and SMDAMAGE bid schedules.
+Assessment: intentional addition; not a divergence in shared calculations.
+
+1.4  Breakeven carbon storage and breakeven timber revenue omitted
+Stata: computes *_breakw1, *_breakw2, *_breakw3, *_breakp families for all genera.
+Python: these are not computed. They are sensitivity-analysis outputs used in Busch
+et al.'s manuscript work and are not needed in the SMDAMAGE pipeline.
+Assessment: correct and intentional omission.
+
+1.5  Buffered and screened MAC variants omitted
+Stata: produces screened (Griscom, Brancalion, Bastin, Walker), buffered, and
+additionality-adjusted MAC curves, disaggregated by biome and genus.
+Python: omits all screening applied to MAC curves. Screening variables (griscom,
+brancalion, bastin, walker, nr_buffer, pl_buffer) are read in and stored in the
+database but are not used to filter cost-effectiveness calculations in the Python script.
+Note: downstream scripts can apply these screens from the stored pixel data.
+Assessment: intentional omission for the SMDAMAGE workflow.
+
+1.6  Harvest-year bucketing is a new layer in the Python
+Stata: calculates exact per-pixel optimal harvest years (nr_harvestyear,
+pinu_harvestyear, etc.) within the Y=30 horizon and uses them directly.
+Python: maps all candidate harvest years through a bucketing scheme loaded from
+Output/choose_harvest_years_mapping.csv (produced by 0_choose_harvest_years.py).
+This reduces the number of distinct rotation years in the SMDAMAGE auction to a
+tractable set while keeping pixels grouped by their bucketed representative year.
+Assessment: intentional SMDAMAGE extension; documented in the Python header.
+
+
+SECTION 2 — DOCUMENTED PARAMETER CHANGES
+-------------------------------------------------------
+
+2.1  Time horizon: Y = 30 (Stata) vs. T = 120 (Python)
+Stata:  scalar Y=30  (line 203)
+Python: TIME_HORIZON_YEARS = 120  (line 81)
+Reason documented in Python comment: the maximum_harvest_year in
+0_choose_harvest_years.py is 120, so carbon schedules and establishment costs must
+be computed over 120 years to cover all possible rotation buckets. Using Y=30 would
+truncate valid rotation lengths.
+Impact: all cumulative carbon totals, establishment-cost NPV multipliers, and
+opportunity-cost sums are computed over a longer horizon in Python than in Stata.
+This is consistent with the extended harvest-year range and is intentional, but it
+makes the two scripts not numerically comparable on those scalars.
+
+2.2  Discount rate: d = 0.05 (Stata) vs. DISCOUNT_RATE = 0.03 (Python)
+Stata:  scalar d=0.05  (line 205)
+Python: DISCOUNT_RATE = 0.03  (line 83)
+Reason documented in Python comment: changed from 0.05 to match the discount_rate
+used in 0_choose_harvest_years.py CONFIG when generating the harvest-year bucket
+mapping CSV. Harvest-year selection and cost discounting must use the same rate so
+that selected rotation years are consistent with the NPV calculations.
+Impact: all discounted quantities differ numerically from Stata. Specifically:
+  - crop_npv_oppcost (opportunity cost sum)
+  - establishment cost NPV multiplier at harvest events
+  - discounted harvested-carbon accumulation
+These are not bugs; they are a deliberate recalibration of the discount rate.
+Note: the Python header originally contained comments stating DISCOUNT_RATE was
+"used only for the Faustmann harvest-year rule." After the session-3 audit, the
+code was updated so DISCOUNT_RATE is used uniformly for all discounted terms, which
+is consistent and correct given the single-rate design decision.
+
+2.3  Faustmann rule form: F=1 throughout (both Stata and Python)
+Both files use the infinite-rotation Faustmann criterion (F=1). This is the default
+in the Stata file and is hard-coded in the Python via AUSTMANN_F = 1 (line 87).
+The Faustmann stopping rule used in Python's calculate_harvest_year() is:
+  rule_lhs = growth_rate_at_(year-1)
+  rule_rhs = d / (1 - (1+d)^-(year-1))
+This matches the Stata logic on line 290:
+  replace harvestyear=i if growth(i-1) > d/(1-(1+d)^-`i-1') & F==1
+with one important difference noted below in Section 3.
+
+
+SECTION 3 — MATHEMATICAL DIVERGENCES (POTENTIAL CORRECTIONS NEEDED)
+-------------------------------------------------------
+
+3.1  Harvest-year loop direction (MINOR — affects only extreme short-rotation pixels)
+Stata (lines 284-295): the forvalues loop runs i=3/Y setting harvestyear=i when the
+Faustmann condition at (i-1) holds. Because the loop overwrites the same variable on
+each pass, the FINAL year for which the rule holds is selected. That is: the largest i
+for which the marginal growth rate at (i-1) exceeds the Faustmann threshold. This is
+the optimal infinite-rotation harvest year.
+Python (calculate_harvest_year, lines 157-163): initialises harvest_year to T+1, then
+for year in range(3, T+1) replaces harvest_year where rule_lhs > rule_rhs. Because
+harvest_year.where() keeps the existing value when the condition is False and writes
+the new (smaller) year value when the condition is True, the SMALLEST matching year
+is retained. This is a reversal of the Stata logic.
+  - Stata: largest valid year wins (last overwrite).
+  - Python: smallest valid year wins (first match retained).
+For many pixels both yield the same result because the marginal growth rate is
+monotonically decreasing, meaning the condition is satisfied continuously up to the
+optimal year and not after. However, for pixels with non-monotone growth curves the
+two can diverge.
+Suggested fix: initialise harvest_year to a series of 3.0, loop upward, and always
+overwrite (keep the LAST matching year), matching Stata's behaviour. Or equivalently,
+run the loop downward from T to 3 and keep the first match.
+
+  Corrected calculate_harvest_year():
+    def calculate_harvest_year(k, time_horizon_years, discount_rate):
+        harvest_year = pd.Series(float(time_horizon_years + 1), index=k.index)
+        for year in range(3, time_horizon_years + 1):
+            rule_lhs = ((1 - np.exp(-k*(year-1)))**2 - (1 - np.exp(-k*(year-2)))**2) \
+                       / ((1 - np.exp(-k*(year-2)))**2).replace(0, np.nan)
+            rule_rhs = discount_rate / (1 - (1 + discount_rate)**(-(year-1)))
+            harvest_year = harvest_year.where(~(rule_lhs > rule_rhs), float(year))
+        return harvest_year.map(load_harvest_year_buckets()).fillna(harvest_year).astype(float)
+  The current code already has this structure. Re-examining: harvest_year.where(cond,
+  other) keeps the existing value where cond is True and replaces with other where
+  cond is False. The condition is ~(rule_lhs > rule_rhs), so replacement with float(year)
+  happens when rule_lhs > rule_rhs. Because year increases each iteration, later
+  (larger) year values overwrite earlier ones whenever the condition holds, which IS
+  consistent with Stata. Status: re-evaluated as CORRECT.
+
+3.2  Aboveground carbon accumulation (wohrv) — UNDISCOUNTED in Python, DISCOUNTED in Stata
+Stata (lines 264-271): nr_accum and genu_accum are discounted present values of annual
+aboveground carbon increments over Y years:
+  nr_accum += (1-d)^(i-1) * nr_A * [ (1-exp(-nr_k*i))^2 - (1-exp(-nr_k*(i-1)))^2 ]
+The Chapman-Richards cumulative form telescopes to nr_A*(1-exp(-nr_k*Y))^2 only when
+undiscounted. With discounting the sum is a different, non-closed-form quantity.
+Python (line 331): uses the telescoped undiscounted closed form:
+  nr_wohrv_total_tC_per_ha = (AGB + BGB*rs)*nr_A*(1-exp(-nr_k*T))^2 + soil_C_term
+This is the UNDISCOUNTED cumulative stock at year T, not the discounted PV.
+The Python also builds nr_annual as undiscounted annual increments and uses those
+in the carbon schedules written to the database.
+Assessment: this is a deliberate design change. The Python header states the output
+table is "Undiscounted_dta_output." Downstream scripts (4_move_Busch_data_to_SMDAMAGE.py)
+apply discounting at four discount rates when computing bid costs. If the intent is to
+use the Stata's discounted total in the cost-effectiveness comparisons that select
+plantation vs. natural regeneration (refortype_whrv), then nr_wohrv_total and the
+genus pl_wohrv_total should also be the discounted sums. Currently they are not.
+Impact: the plantation-vs-NR comparison uses undiscounted carbon totals in the
+denominator but partially discounted costs in the numerator, which is internally
+inconsistent with the Stata formulation.
+Suggested correction: either (a) compute discounted carbon totals for
+cost-effectiveness comparisons and keep undiscounted arrays for the database export,
+or (b) document explicitly that the cost-effectiveness comparison is performed on an
+undiscounted basis (which is a valid methodological choice but differs from Stata).
+
+3.3  Soil carbon (wohrv) — linear accumulation in Python, discounted sum in Stata
+Stata (lines 386-393):
+  nr_soilC += (1-d)^(i-1) * nrsoil   [discounted]
+  genu_soilC_wohrv += (1-d)^(i-1) * plantsoil  [discounted]
+Python (line 331): adds SOIL_C_POOL * T * (NATURAL_SOIL_C + PLANTATION_SOIL_C)
+This is an undiscounted linear sum of soil accumulation over T years.
+Same status as 3.2: deliberate undiscounted basis; creates internal inconsistency
+with the cost term if cost-effectiveness is meant to match Stata.
+
+3.4  Soil carbon (whrv, with harvest) — truncated accumulation in Python
+Stata (lines 396-403):
+  genu_soilC_whrv += (1-d)^(i-1) * plantsoil if i < genu_harvestyear
+Soil carbon only accumulates in years before the first harvest (i.e., years 1 to
+harvestyear-1 per rotation cycle, then resets). With multiple harvests this means
+soil carbon is counted only in years preceding each harvest, then the clock resets.
+Python (lines 407-408):
+  g_soil_2d = PLANTATION_SOIL_C * minimum(maximum(hy_ch - 1.0, 0.0), yr)
+This caps soil carbon at (harvestyear - 1) and holds it flat after that. This
+correctly captures the within-rotation accumulation for the final rotation cycle
+but does not re-accumulate across multiple harvest cycles over the 120-year horizon.
+For a 120-year horizon with harvestyear = 20, the Stata logic would accumulate soil
+carbon in years 1-19, 21-39, 41-59, etc. (up to 6 full cycles). The Python version
+gives soil carbon only up to year 19.
+Suggested correction: replace the soil_2d formula with a per-cycle accumulation:
+  yr_within_cycle = np.mod(yr, hy_ch)
+  g_soil_2d = PLANTATION_SOIL_C * np.minimum(np.maximum(yr_within_cycle - 1.0, 0.0),
+              hy_ch - 1.0)
+This matches the per-cycle restart in Stata. Note: Stata also discounts soil carbon,
+so the corrected Python should also apply the discount weights if matching Stata
+exactly (or accept the undiscounted basis for consistency with point 3.2).
+
+3.5  Standing stock (whrv) — different accumulation formula
+Stata (lines 308-315): genu_stock is the discounted PV of annual increments in
+standing carbon, where each year the biomass resets to zero at harvest:
+  genu_stock += (1-d)^(i-1) * A * [ (1-exp(-k*mod(i,hy)))^2 - (1-exp(-k*mod(i-1,hy)))^2 ]
+Python (lines 403-404): computes the standing stock at each year-end directly via
+  g_stock_2d = A * (1 - exp(-k * mod(yr, hy)))^2
+and takes cumulative differences via np.diff to get annual increments.
+The cumulative-at-end-of-year approach in Python is the undiscounted standing stock,
+whereas Stata accumulates discounted annual increments. The two yield the same
+biomass trajectory only when d=0.
+Same status as 3.2: consistent within the undiscounted design but differs from Stata.
+
+3.6  Discounted harvested carbon — formula matches Stata now (after session-3 fix)
+Stata (lines 362-366):
+  genu_harvested += (1-d)^(i-1) * A*(1-exp(-k*i))^2  if mod(i, hy)==0
+Python (lines 408-409, after fix):
+  harv_c = A * (1-exp(-k*yr))^2 * harvest
+  harv_c *= (1-d)^(yr-1)   # d = DISCOUNT_RATE = 0.03
+  harv_c = cumsum(harv_c)
+The formula is now structurally equivalent to Stata. The remaining numerical
+difference is the discount rate: Python uses 0.03, Stata uses 0.05.
+Assessment: formula correct; rate difference is documented and intentional.
+
+3.7  Establishment-cost NPV multiplier — formula now matches Stata (after session-3 fix)
+Stata (line 345):
+  genu_npv_estcost += (1-d)^(i-1) * genu_npv_estcost  if mod(i, hy)==0
+  which is:  estcost *= (1 + (1-d)^(i-1))  at each harvest year
+Python (lines 428-433, after fix):
+  harvest_years = hy_int * [1, 2, 3, ...]
+  valid = harvest_years <= T
+  weights = (1-d)^(harvest_years - 1)
+  g_npv_mult = product of (1 + weights) for valid harvest years
+  g_npv_f = g_npv_init * g_npv_mult
+This is algebraically equivalent to applying the Stata recursive update at each
+harvest event across the full T-year horizon. Formula is now correct.
+Remaining numerical difference: Python uses d=0.03, Stata uses d=0.05.
+
+3.8  Opportunity cost — formula matches Stata (after session-3 fix)
+Stata (lines 350-352):
+  crop_npv_oppcost = sum over i=1 to Y of crop_va * (1-d)^(i-1)
+Python (line 375, after fix):
+  oppcost_discount_sum = sum of (1-DISCOUNT_RATE)^(i-1) for i=1 to T
+  used in denominators: crop_va * oppcost_discount_sum + ...
+Formula is now structurally equivalent to Stata. Numerical difference remains
+because T=120 vs. Y=30 and DISCOUNT_RATE=0.03 vs. d=0.05.
+
+3.9  Natural regeneration total carbon (nr_wohrv_totalC) — different formula
+Stata: nr_wohrv_totalC = agbC*nr_accum + bgbC*nr_bgC + soilC*nr_soilC
+  where nr_accum is the discounted PV of annual AGB increments (over 30 years),
+  nr_bgC = nr_accum * nr_rootshoot (discounted PV of BGB),
+  nr_soilC is the discounted PV of soil carbon (over 30 years).
+  Note: the Stata code runs the nr_soilC loop twice — once for nrsoil and once for
+  plantsoil (lines 384-393 and 395-401), effectively doubling soil carbon.
+  This is a known quirk in the Stata code.
+Python: nr_wohrv_total_tC_per_ha = (AGB+BGB*rs)*A*(1-exp(-k*T))^2
+                                   + SOIL_C_POOL * T * (NATURAL_SOIL_C + PLANTATION_SOIL_C)
+  Uses the closed-form undiscounted cumulative biomass formula and adds both
+  NATURAL_SOIL_C and PLANTATION_SOIL_C over T years.
+  The Python correctly adds both soil-carbon terms, which numerically matches the
+  doubled soil accumulation in Stata, but via explicit constants rather than the
+  accidental double-loop. This is a documented correction.
+Assessment: the doubling of the soil-carbon term in Python is intentional and
+matches the Stata behaviour. The undiscounted basis is intentional.
+
+
+SECTION 4 — DISCOUNTING ARCHITECTURE SUMMARY
+-------------------------------------------------------
+
+In Stata all quantities — carbon, costs, and opportunity costs — are discounted
+present values computed with d=0.05 over Y=30 years. The cost-effectiveness ratio
+numerator and denominator are thus both on a consistent discounted PV basis.
+
+In Python the architecture is deliberately split:
+  - Carbon quantities (nr_annual, pl_annual, nr_wohrv_total, g_wohrv_total,
+    g_whrv_total) are UNDISCOUNTED. These go into the database for downstream
+    SMDAMAGE use. Discounting at multiple rates is applied later by
+    4_move_Busch_data_to_SMDAMAGE.py.
+  - Cost quantities (establishment NPV multiplier, opportunity cost sum, discounted
+    harvested carbon) ARE discounted with DISCOUNT_RATE=0.03 over T=120 years.
+  - The cost-effectiveness comparisons (refortype selection) therefore mix
+    undiscounted carbon totals with discounted cost totals. This is internally
+    inconsistent with the Stata formulation.
+
+If the goal is to produce the same plantation-vs-NR selection decisions as Stata, the
+cost-effectiveness comparisons should either:
+  (a) use discounted carbon totals for the denominators of the costeff ratios, or
+  (b) use undiscounted cost totals in the numerators to match the undiscounted carbon
+      in the denominators.
+Option (b) would mean using crop_va * T (undiscounted opportunity cost sum) and
+g_npv_init (undiscounted establishment cost, no harvest-cycling multiplier). This
+is the simpler path and would make costeff numerators and denominators both undiscounted,
+which is a valid and consistent alternative model.
+
+
+SECTION 5 — MINOR CODE POINTS
+-------------------------------------------------------
+
+5.1  Stata runs harvestyear loop for i=2 to Y; Python starts at year=3
+Stata generates growth variables for i=2 to Y, then applies the Faustmann rule for
+i=3 to Y. Python's calculate_harvest_year() starts the comparison at year=3, which
+is correct for the Faustmann rule (year-1=2 is the minimum meaningful comparison).
+
+5.2  Soil-carbon NR formula in Stata has a second loop adding plantsoil
+Stata lines 384-401 run nr_soilC twice: once adding nrsoil and once adding plantsoil.
+This means nr_soilC = discountedPV(nrsoil + plantsoil) over Y years. Python adds
+(NATURAL_SOIL_C + PLANTATION_SOIL_C) * T in one term. Both accumulate two soil-carbon
+constants. The Stata version is likely a coding artefact (plantsoil added to nr_soilC
+in the harvest-version loop, lines 395-398, even though it is inside what should be
+the whrv section); Python's explicit sum of both constants is the cleaner form and
+matches the numerical result.
+
+5.3  harvestC pool toggle
+Stata: harvestC scalar set to 1 (default). Controls whether harvested carbon enters
+totalC via harvestC*w*genu_harvested.
+Python: HARVEST_C_POOL = 1. Used consistently in g_whrv_total formula. Matches Stata.
+
+5.4  F=0 and F=2 Faustmann alternatives not available in Python
+Stata implements single-cycle (F=0) and MAI-maximising (F=2) rules alongside the
+infinite-cycle Faustmann rule (F=1). Python only implements F=1 (AUSTMANN_F is defined
+but never used to branch logic). This is acceptable for SMDAMAGE use but should be
+noted.
+
+
+SECTION 6 — LINES TO CHANGE FOR IMPROVED FIDELITY
+-------------------------------------------------------
+
+If the goal is to make cost-effectiveness comparisons consistent (either fully
+undiscounted or fully discounted to match Stata), the following changes are needed:
+
+Option A — Make all cost-effectiveness comparisons fully undiscounted (simplest):
+  Line ~331: keep nr_wohrv_total_tC_per_ha as is (already undiscounted).
+  Line ~373: change oppcost_discount_sum to undiscounted: T  (i.e., just multiply
+    crop_va by Years_time_horizon, reverting to the original form).
+  Lines ~428-433: change g_npv_f = g_npv_init  (no harvest-cycling NPV multiplier;
+    establishment cost paid once only).
+  Lines ~408-409: remove the discount-factor multiplication on harv_c (harvested
+    carbon should also be undiscounted if the rest of the basis is undiscounted).
+  Result: cost-effectiveness = (crop_va*T + nr_cost) / (3.67 * nr_total_undiscounted).
+  This is internally consistent and simpler, but differs from Stata in the cost
+  NPV treatment.
+
+Option B — Match Stata discounting (harder; requires discounted carbon totals):
+  Compute discounted carbon totals separately for the costeff comparisons while
+  keeping nr_annual/pl_annual undiscounted for the database export.
+  This requires adding discounted-carbon aggregation blocks that mirror the Stata
+  loops, which is feasible but adds code complexity.
+
+Soil carbon with-harvest correction (Section 3.4) — applies in either option:
+  Replace the g_soil_2d formula (lines ~407-408) with a per-cycle accumulation:
+    yr_within_cycle = np.mod(yr, hy_ch)
+    g_soil_2d = PLANTATION_SOIL_C * np.minimum(np.maximum(yr_within_cycle - 1.0, 0.0),
+                hy_ch - 1.0)
+  This correctly restarts soil-carbon accumulation at each harvest event rather than
+  capping it at harvestyear-1 for the entire horizon.
+
+
+SECTION 7 — VERIFIED CORRECT ITEMS
+-------------------------------------------------------
+
+These items were checked and found consistent between the two files:
+  - Cost inflation factor 1.1577 (Stata line 56; Python line ~290)
+  - Biome filter: drop biomes==13 and biomes==14 (Stata lines 50-51; Python ~272-273)
+  - GENUS_BY_TYPE mapping (Stata lines 62-76; Python constant at line 80)
+  - Root-to-shoot ratio tables NR_ROOTSHOOT_RULES, PL_ROOTSHOOT_RULES
+  - WOOD_PRODUCT_STORAGE_MAP (w values) — exact match to Stata
+  - WOOD_PRODUCT_REVENUE_MAP (p values) — exact match to Stata
+  - EXOTIC_SHARE_MAP — exact match to Stata
+  - Continent assignments AFRI/AMER/ASIA — exact match to Stata
+  - AGB_C_POOL, BGB_C_POOL, SOIL_C_POOL, HARVEST_C_POOL all = 1 (matching Stata defaults)
+  - NATURAL_SOIL_C = 0.415107735, PLANTATION_SOIL_C = 0.092749069 (exact match)
+  - Faustmann rule form F=1 (infinite-cycle)
+  - refortype_whrv selection logic including negative-costeff override for "P"
+  - mi_whrv_costeff left as NaN when refortype_whrv = "." (matches Stata blank behaviour)
+  - cunn genus uses np_cost for CHN, ep_cost elsewhere (Stata line 335-336; Python ~384-385)
+  - euca genus always uses ep_cost (Stata line 337; Python ~386)
+  - negative A and k values truncated to zero (Stata lines 155-170; Python ~285-290)
+
+
+SOURCES CONSULTED
+-------------------------------------------------------
+- DO code/1. Model loop all data corrected.do (Stata source of truth)
+- JFR code/1_import_Busch2024_to_SMDAMAGE.py (Python pipeline under audit)
+- JFR knowledge base: Busch 2024 Source Summaries/1 Model loop all data.md
+- JFR knowledge base: Busch 2024 Known Findings.md
+- JFR knowledge base: Busch 2024 Methodology Lineage.md
+- Session conversation record, 2026-07-03

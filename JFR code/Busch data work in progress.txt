@@ -1,23 +1,27 @@
 Plan to take data from “Cost-effectiveness of natural forest regeneration and plantations for climate mitigation,” Busch et al, into SMDAMAGE
 
-DONE. 1. Create a database of their data.
+1. Create a database of their data.
 	Table Busch2024_undiscounted_dta_output
     • Country, pixel id, genus, values A and k for best harvest type, 
     • best harvest type: natural regeneration, native plantation, or exotic plantation.
     • Y = harvest year or planning horizon, mapping to contract length.
     • areaid  area in hectares,
-    • Bid cost per hectare: NPV(contract length Y, crop_va) + nr_cost + ep_cost + np_cost – p. Two of these will be zero.
-        ◦ crop_va: opportunity cost per hectare. I will convert this to an NPV at the start of the contract for the length of the contract, 
-		crop_va*∑Yu=0 (1 – discount_rate)u. SMDAMAGE will then discount it again from year t back to the 2026.
-        ◦ nr_cost: natural regeneration planting cost per hectare in 2020 USD,
-        ◦ np_cost: native plantation planting cost per hectare in 2020 USD,
-        ◦ ep_cost: exotic plantation planting cost per hectare in 2020 USD,
-        ◦ p: revenue from wood products (net of harvest and delivery costs) as a scalar of carbon at time of harvest. 
+		◦ crop_va: opportunity cost/hectare/year. I will discount crop_va over the length of the contract to the start of the contract, 
+			as NPV(contract length Y, crop_va) = crop_va*sum{t=0 to Y}(1 – discount_rate)^t. 
+			SMDAMAGE will then discount it again from the planting year back to the 2026.
+			Because I run different discount rates in SMDAMAGE, I store this discounted value for multiple discount rates.
+		◦ nr_cost: natural regeneration planting cost per hectare in 2020 USD,
+		◦ np_cost: native plantation planting cost per hectare in 2020 USD,
+		◦ ep_cost: exotic plantation planting cost per hectare in 2020 USD,
+		◦ p: revenue from wood products (net of harvest and delivery costs) as a scalar of carbon at time of harvest. 
+    Then bid cost per hectare: NPV(contract length Y, crop_va) + nr_cost + ep_cost + np_cost – p. 
+	Two of these will be zero, because we commit to either natural regeneration or exotic plantation.
+
 		Must accrue only once for each contract? I guess the auction manager could buy a contract where the supplier repeatedly harvested the trees.
 	Table Busch2024_undiscounted_tC_per_h_year
     • Carbon removal per hectare in each year 1, …, Y.
 
-DONE. 2. Given the above data, I want to categorize carbon removal per hectare into maybe 50 bins. Each bin has total Areap in millions of hectares.
+2. Given the above data, I want to categorize carbon removal per hectare into maybe 50 bins. Each bin has total Areap in millions of hectares.
 To do this binning, I need the full solution database. Then I will query it to categorize the carbon removal schedules.
 
 I used JFR code/2_k_means_carbon_removal.py to compress pixel-level carbon-removal schedules into forestry bidders for SMDAMAGE. 

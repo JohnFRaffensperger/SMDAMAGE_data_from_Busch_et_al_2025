@@ -98,6 +98,7 @@ def run_kmeans(data: np.ndarray, k: int, max_iter: int, tol: float, seed: int) -
 		centers, counts = recompute_centers(data, labels, centers)
 		max_shift = np.max(np.linalg.norm(centers - old_centers, axis=1)) if len(centers) else 0.0
 		if max_shift <= tol: break
+		# if iteration % 100: print ("iteration ", iteration)
 	final_labels = assign_all_labels(data, centers)
 	centers, final_counts = recompute_centers(data, final_labels, centers)
 	final_labels = assign_all_labels(data, centers)
@@ -362,7 +363,14 @@ if __name__ == "__main__":
 	# I experimented with k-means using batching, which is faster than full k-means.
 	# After the experiments, I settled on these values, ran full k-means,
 	# and wrote the results to the Busch2024_to_SMDAMAGE database.
-	cluster_trees(rotation_year=32, k=[12], write_to_CSV=True) 
+	# Count of rotation years in Busch2024_to_SMDAMAGE.Undiscounted_dta_output
+	# Null	448,857
+	# 32.0	4,4467,659
+	# 38.0	756,185
+	# 46.0	45,335
+	# 120.0	13,035,652
+
+	# cluster_trees(rotation_year=46, k=[12], write_to_CSV=True) 
 	# cluster_trees(rotation_year=38, k=[12], write_to_CSV=True) 
 	# cluster_trees(rotation_year=46, k=[12], write_to_CSV=True) 
 	# cluster_trees(rotation_year=57, k=[12], write_to_CSV=True) 
@@ -370,8 +378,8 @@ if __name__ == "__main__":
 	# cluster_trees(rotation_year=101, k=[12], write_to_CSV=True) 
 
 	config = CONFIG
-	config.rotation_year = 32
-	config.max_years = 101
+	config.rotation_year = 38 #, 32, 120 # Done 46
+	config.max_years = 120
 	config.seed = 0
 	config.max_iter = 4000
 	config.tol = 1e-6
