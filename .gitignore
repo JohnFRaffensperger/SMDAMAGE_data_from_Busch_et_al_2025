@@ -17,7 +17,7 @@ Input/*.dta
 Output/maps/*.dta
 
 # SQLite databases produced/updated by import/export pipelines
-Output/Databases/*.sqlite
+*.sqlite
 
 # Large generated artifacts from pipeline scripts
 Output/Kmeans_temp_files/*.csv
