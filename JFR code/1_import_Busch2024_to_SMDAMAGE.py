@@ -1,4 +1,8 @@
 ﻿# 1_import_Busch2024_to_SMDAMAGE.py — Written by JFR and CoPilot (mostly Claude), 2026-07-01.
+# Obsolete. I used this code to develop forestry bids for SMDAMAGE, but was not satisfied with the results.
+# First, not enough area was included. Second, the contract lengths were not tuned to the warming price, 
+# but only the Busch et al $/tC logic. 
+
 # Purpose: the completed database Busch2024_to_SMDAMAGE.sqlite is the data bridge between the Busch 2024 paper and SMDAMAGE.
 # Later in the workflow, SMDAMAGE project file create_database.py reads Busch2024_to_SMDAMAGE.sqlite 
 # and loads forestry bidders, one per (rotation_year, cluster_index), into the SMDAMAGE auction.
