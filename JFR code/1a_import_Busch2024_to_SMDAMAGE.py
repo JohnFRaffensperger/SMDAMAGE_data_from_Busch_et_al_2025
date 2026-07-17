@@ -6,13 +6,13 @@
 # Later in the workflow, SMDAMAGE project file create_database.py reads Busch2024_to_SMDAMAGE.sqlite
 # and loads forestry bidders, one per group, into the SMDAMAGE auction.
 
-# The code takes over an hour to run on my HP Envy laptop and is likely to run out of memory in the process.
-# Hence the re-start option.
-# I set it to run by .dta input file size increasing, so you can see progress.
+# Despite repeatedly nagging Claude to make it faster and use less memory, the code takes over an hour to run 
+# on my HP Envy laptop and is likely to run out of memory in the process. Hence the re-start option. 
+# I set it to run by .dta input file size increasing, so at least you can see progress.
 
-# Origin: I adapted this code from "1. Model loop all data corrected.do", the Stata pipeline published by Busch et al,
+# Origin: I adapted this code from "1. Model loop all data corrected.do", Stata code published by Busch et al,
 # "Cost-effectiveness of natural forest regeneration and plantations for climate mitigation" (2024).
-# That Stata script reads per-country .dta input files, applies biome and geographic filters,
+# That Stata code reads per-country .dta input files, applies biome and geographic filters,
 # computes Chapman-Richards carbon growth curves under natural regeneration and plantation scenarios,
 # applies IPCC root-to-shoot ratios and FAO ecozone rules, evaluates cost-effectiveness per pixel
 # in $/tCO2, and selects the least-cost reforestation option for each pixel.
@@ -47,27 +47,30 @@
 # bid-step supply curves (forestry_bid_curves), one curve per (contract_length, cluster_index).
 
 from __future__ import annotations
+import csv
 import time
 from pathlib import Path
-import sqlite3
 import numpy as np
 import pandas as pd # pandas allows chunked reading of the very large files, lowering memory requirements.
 
-DISCOUNT_RATE = 0.03 # Used for bid discounting; 3% real rate.
-SKIP_SQLITE_EXPORT = False
-SMDAMAGE_DB_FILE = "Busch2024_to_SMDAMAGE.sqlite"
+DISCOUNT_RATE = 0.03 # Contract length is chosen using this rate.
 
 DTA_DIR  = Path(__file__).resolve().parent.parent / "Input"
-MACC_DIR = Path(__file__).resolve().parent.parent / "Output" / "Databases"
+OUTPUT_CSV_DIR = Path(__file__).resolve().parent.parent / "Output" / "Databases"
+UNDISCOUNTED_CSV_PREFIX = "undiscounted_contracts" # Output CSV files: one per contract length.
 
 TARGET_PIXEL_ID = 5119
 RUN_ONLY_ONE_PIXEL = False
-
-SMDAMAGE_PIXEL_TABLE = "Undiscounted_dta_output"
-SMDAMAGE_YEAR_TABLE = "tC_per_h_per_year"
 GENUS_ORDER = ["pinu", "cunn", "euca", "brde", "brev", "nede", "neev"]
 GENUS_BY_TYPE = {1: "neev", 2: "brev", 3: "brde", 4: "neev", 5: "cunn", 6: "euca", 7: "nede", 8: "neev", 9: "pinu", 10: "brde", 11: "neev", 12: "brde", 13: "brev", 14: "brde", 15: "neev"}
-TIME_HORIZON_YEARS = 120 # Must cover the full contract-length range (lengths goes to 115).
+_GENUS_LOOKUP = np.array([""] * 16, dtype=object) # numpy lookup for type→genus; replaces Python dict loop per pixel.
+for _k, _v in GENUS_BY_TYPE.items(): _GENUS_LOOKUP[_k] = _v
+
+# In the Chapman-Richards growth function, A is the asymptotic growth peak and k is the % growth per year.
+KEEP_COLS = {"biomes", "nr_A", "nr_k", "type", "fao_ecoz", "area_m2", "nr_cost", "ep_cost", "np_cost", "crop_va", "griscom", "brancalion", "bastin", "walker", "nr_buffer", "pl_buffer"} | {f"{g}_{s}" for g in GENUS_ORDER for s in ["A", "k"]}
+CLAMP_COLS = ["nr_A", "nr_k"] + [f"{g}_{s}" for g in GENUS_ORDER for s in ["A", "k"]] # Precomputed to avoid per-chunk list construction.
+KEEP_FOR_OUTPUT = {"id", "nr_A", "nr_k", "nr_rootshoot", "pl_rootshoot", "area_ha", "crop_va"} | {f"{g}_{s}" for g in GENUS_ORDER for s in ["A", "k"]} # Columns needed for SQLite output; all others dropped before valid-mask filter.
+# TIME_HORIZON_YEARS = 120 # Must cover the full contract-length range (lengths goes to 115).
 AUSTMANN_F = 1
 NATURAL_SOIL_C = 0.415107735
 PLANTATION_SOIL_C = 0.092749069
@@ -76,7 +79,7 @@ BGB_C_POOL = 1
 SOIL_C_POOL = 1
 HARVEST_C_POOL = 1
 SMALL_DTA_COUNT = 50
-CHUNK_SIZE = 10_000
+CHUNK_SIZE = 20_000
 
 AFRI = {"DZA", "AGO", "BEN", "BWA", "BFA", "BDI", "CPV", "CMR", "CAF", "TCD", "COM", "COG", "CIV", "COD", "DJI", "EGY", "GNQ",
 	"ERI", "SWZ", "ETH", "GAB", "GMB", "GHA", "GIN", "GNB", "KEN", "LSO", "LBR", "LBY", "MDG", "MWI", "MDV", "MLI", "MRT", "MUS",
@@ -92,6 +95,8 @@ NR_ROOTSHOOT_RULES = {(11, "AFRI"): 0.825, (11, "AMER"): 0.221, (11, "ASIA"): 0.
 	(13, "AFRI"): 0.332, (13, "AMER"): 0.334, (13, "ASIA"): 0.440, (16, "AMER"): 0.348, (16, "ASIA"): 0.322, (21, "AFRI"): 0.232, (21, "AMER"): 0.175,
 	(21, "ASIA"): 0.230, (22, "AMER"): 0.336, (22, "ASIA"): 0.440, (23, "AMER"): 1.338, (23, "ASIA"): 1.338}
 PL_ROOTSHOOT_RULES = {(11, "AMER"): 0.170, (11, "ASIA"): 0.325, (16, "AMER"): 2.158, (23, "ASIA"): 2.158}
+NR_ROOTSHOOT = {c: {eco: v for (eco, cc), v in NR_ROOTSHOOT_RULES.items() if cc == c} for c in ("AFRI", "AMER", "ASIA")} # Continent-filtered rootshoot lookup; avoids per-chunk branch checking.
+PL_ROOTSHOOT = {c: {eco: v for (eco, cc), v in PL_ROOTSHOOT_RULES.items() if cc == c} for c in ("AFRI", "AMER", "ASIA")}
 
 WOOD_PRODUCT_STORAGE_MAP = {0.188: {"ATG", "BLZ", "BRB", "CRI", "CUB", "DMA", "DOM", "GRD", "GTM", "HND", "HTI", "JAM", "KNA", "LCA", "MEX", "NIC", "PAN", "SLV", "TTO", "VCT"},
 	0.268: {"ARG", "BOL", "BRA", "CHL", "COL", "ECU", "GUF", "GUY", "PER", "PRY", "SUR", "URY", "VEN"},
@@ -137,18 +142,39 @@ N_L = len(LENGTHS)
 T_ARR = np.arange(T_MAX + 1, dtype=float)
 WPT_MAT = np.zeros((N_L, T_MAX + 1))
 for _i, _T in enumerate(LENGTHS): WPT_MAT[_i, :_T+1] = W_Carbon_T[_T::-1]
-DISC_ARR = (1.0 - (1.0 + DISCOUNT_RATE) ** (-LENGTHS)) / DISCOUNT_RATE # Annuity factors; recompute if DISCOUNT_RATE changes.
+DISC_ARR = (1.0 - (1.0 + DISCOUNT_RATE) ** (-LENGTHS)) / DISCOUNT_RATE # Annuity factors at r=0.03 used for contract-length selection.
+COMPOUND_ARR = (1.0 + DISCOUNT_RATE) ** LENGTHS # Compound factors at r=0.03 used for contract-length selection.
 
-def initialize_smdamage_database(output_dir: Path) -> None:
+# Multi-rate bid evaluation. Contract length is fixed by the r=0.03 selection above;
+# bids are then re-evaluated at these four rates so downstream code can apply any rate.
+RATES = np.array([0.00, 0.015, 0.03, 0.06])
+DISC_ARR_MULTI = np.where(RATES[:, None] == 0.0, LENGTHS[None, :].astype(float), (1.0 - (1.0 + RATES[:, None])**(-LENGTHS[None, :])) / RATES[:, None])  # (4, N_L)
+COMPOUND_ARR_MULTI = (1.0 + RATES[:, None])**LENGTHS[None, :]  # (4, N_L)
+TS_ARR_BY_T   = {int(T): np.arange(T, dtype=float)    for T in LENGTHS} # Pre-built year arrays for year-table output.
+YEAR_ARR_BY_T   = {int(T): np.arange(T, dtype=np.int32) for T in LENGTHS}
+WPT_MAT_F32     = WPT_MAT.astype(np.float32)     # float32 for SGEMM (~2x faster than DGEMM).
+T_ARR_F32       = T_ARR.astype(np.float32)
+TS_ARR_BY_T_F32 = {T: arr.astype(np.float32) for T, arr in TS_ARR_BY_T.items()}
+
+def csv_path_for_length(output_dir: Path, T: int) -> Path:
+	return output_dir / f"{UNDISCOUNTED_CSV_PREFIX}_{T:03d}.csv"
+
+def initialize_csv_writers(output_dir: Path) -> tuple[dict[int, csv.writer], dict[int, object]]:
+	# Open one CSV file per contract length and write the header row.
+	# Returns (writers, handles) dicts keyed by contract length (int).
 	output_dir.mkdir(parents=True, exist_ok=True)
-	with sqlite3.connect(output_dir / SMDAMAGE_DB_FILE) as conn:
-		conn.execute(f"DROP TABLE IF EXISTS {SMDAMAGE_PIXEL_TABLE}")
-		conn.execute(f"DROP TABLE IF EXISTS {SMDAMAGE_YEAR_TABLE}")
-		conn.execute(f"CREATE TABLE {SMDAMAGE_PIXEL_TABLE} (country TEXT NOT NULL, pixel_id INTEGER NOT NULL, option TEXT, best_contract_length INTEGER, bid REAL, bid_score INTEGER, area_ha REAL, crop_va_USD_per_ha_per_year REAL)")
-		conn.execute(f"CREATE TABLE {SMDAMAGE_YEAR_TABLE} (country TEXT NOT NULL, pixel_id INTEGER NOT NULL, year INTEGER NOT NULL, tC_per_ha_per_year REAL)")
+	writers: dict[int, csv.writer] = {}
+	handles: dict[int, object] = {}
+	for T in LENGTHS.astype(int):
+		fh = open(csv_path_for_length(output_dir, T), "w", newline="", encoding="utf-8")
+		w = csv.writer(fh)
+		w.writerow(["pixel_id", "option", "best_contract_length", "bid_r000", "bid_r015", "bid_r030", "bid_r060", "area_ha", "crop_va_USD_per_ha_per_year"] + [f"year{y}" for y in range(1, T + 1)])
+		writers[T] = w
+		handles[T] = fh
+	return writers, handles
 
 # Process one chunk of pixels for a country; called once per CHUNK_SIZE-row batch by process_country.
-def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], macc_dir: Path) -> None:
+def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], csv_writers: dict[int, csv.writer]) -> None:
 	N = len(all_rows_for_one_country["id"])
 
 	# Data cleaning: ensure required columns exist with sensible defaults.
@@ -174,11 +200,11 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], mac
 	for c in ["nr_cost", "ep_cost", "np_cost"]: all_rows_for_one_country[c] = all_rows_for_one_country[c] * 1.1577
 
 	# Truncate negative A and k values at zero before growth calculations. JFR: a negative k implies growth without bound. Negative A implies growth toward a negative value.
-	for col in ["nr_A", "nr_k"] + [f"{g}_{s}" for g in GENUS_ORDER for s in ["A", "k"]]:
+	for col in CLAMP_COLS:
 		if col in all_rows_for_one_country: all_rows_for_one_country[col][all_rows_for_one_country[col] < 0] = 0.0
 
-	# Plantation genus mapping.
-	genus_arr = np.array([GENUS_BY_TYPE.get(t, "") for t in all_rows_for_one_country["type"].astype(int)], dtype=object)
+	# Plantation genus mapping. Speed-up: numpy lookup replaces Python dict-loop per pixel.
+	genus_arr = _GENUS_LOOKUP[all_rows_for_one_country["type"].astype(int)]
 	all_rows_for_one_country["genus"] = genus_arr
 	all_rows_for_one_country["genus_A"] = np.full(N, np.nan)
 	all_rows_for_one_country["genus_k"] = np.full(N, np.nan)
@@ -198,10 +224,10 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], mac
 	is_brde_nede = np.isin(genus_arr, ["brde", "nede"])
 	is_pinu_cunn_brev_neev = np.isin(genus_arr, ["pinu", "cunn", "brev", "neev"])
 
-	for (eco, cont), value in NR_ROOTSHOOT_RULES.items():
-		if cont == continent: all_rows_for_one_country["nr_rootshoot"][all_rows_for_one_country["fao_ecoz"] == eco] = value
-	for (eco, cont), value in PL_ROOTSHOOT_RULES.items():
-		if cont == continent: all_rows_for_one_country["pl_rootshoot"][all_rows_for_one_country["fao_ecoz"] == eco] = value
+	for eco, value in NR_ROOTSHOOT.get(continent, {}).items():
+		all_rows_for_one_country["nr_rootshoot"][all_rows_for_one_country["fao_ecoz"] == eco] = value
+	for eco, value in PL_ROOTSHOOT.get(continent, {}).items():
+		all_rows_for_one_country["pl_rootshoot"][all_rows_for_one_country["fao_ecoz"] == eco] = value
 
 	if continent == "AMER":
 		all_rows_for_one_country["nr_rootshoot"][(all_rows_for_one_country["fao_ecoz"] == 31) & is_brde_nede] = 0.466
@@ -234,11 +260,12 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], mac
 
 	# LENGTHS, T_ARR, WPT_MAT, DISC_ARR are module-level constants computed once at startup.
 	nr_scale = 2*nr_A*nr_k*(AGB_C_POOL + BGB_C_POOL*nr_rootshoot) # (N,)
-	cs_nr = nr_scale[:,None]*(np.exp(-nr_k[:,None]*T_ARR) - np.exp(-2*nr_k[:,None]*T_ARR)) + SOIL_C_POOL*NATURAL_SOIL_C # (N, T_MAX+1)
-	warming_arr = WPT_MAT @ cs_nr.T # (N_L, N)
+	_e1_nr = np.exp(-nr_k.astype(np.float32)[:,None]*T_ARR_F32) # float32 exp; ~2x faster; use e**2 instead of second call.
+	cs_nr = (nr_scale.astype(np.float32)[:,None]*(_e1_nr - _e1_nr**2) + np.float32(SOIL_C_POOL*NATURAL_SOIL_C)) # (N, T_MAX+1) float32
+	warming_arr = WPT_MAT_F32 @ cs_nr.T # float32 SGEMM; ~2x faster than float64 DGEMM
 	bid_arr = all_rows_for_one_country["nr_cost"] + all_rows_for_one_country["crop_va"] * DISC_ARR[:, None] # (N_L, N)
 	# Find the contract length with cheapest $/(cooling °C) for natural regeneration.
-	score_arr = bid_arr / warming_arr # (N_L, N)
+	score_arr = bid_arr / warming_arr # (N_L, N) — float32 warming_arr upcasts to float64
 	np.nan_to_num(score_arr, nan=np.inf, copy=False) # NaN bid/warming → inf; never chosen as best
 	nr_idx = np.argmin(score_arr, axis=0) # (N,) index into LENGTHS
 	nr_best_contract_length = LENGTHS[nr_idx]
@@ -246,6 +273,10 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], mac
 	best_length = nr_best_contract_length.astype(float)
 	best_score = score_arr[nr_idx, np.arange(N)]
 	best_bid = bid_arr[nr_idx, np.arange(N)]
+	# Track per-pixel establishment cost and harvest carbon for multi-rate bid computation below.
+	best_est_cost = all_rows_for_one_country["nr_cost"].copy()  # est cost at the chosen option
+	best_harvest_at_T = np.zeros(N)  # A*(1-exp(-k*T))^2 at the chosen T; 0 for NR
+	del _e1_nr, cs_nr, warming_arr, score_arr, bid_arr # Memory: free NR intermediates before plantation loop.
 
 	#2.2 Plantation calculations.
 	all_rows_for_one_country["pl_best_contract_length"] = np.full(N, np.nan)
@@ -258,12 +289,13 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], mac
 		Ng = int(np.sum(mask_g))
 		# Speed-up: same matrix-multiply pattern as NR; cs_pl (Ng, T_max+1), warming_g (n_L, Ng).
 		pl_scale = 2*A_g*k_g*(AGB_C_POOL + BGB_C_POOL*rs_g) # (Ng,)
-		cs_pl = pl_scale[:,None]*(np.exp(-k_g[:,None]*T_ARR) - np.exp(-2*k_g[:,None]*T_ARR)) + SOIL_C_POOL*PLANTATION_SOIL_C # (Ng, T_MAX+1)
-		warming_g = WPT_MAT @ cs_pl.T # (N_L, Ng)
+		_e1_pl = np.exp(-k_g.astype(np.float32)[:,None]*T_ARR_F32) # float32 exp; ~2x faster; use e**2 instead of second call.
+		cs_pl = (pl_scale.astype(np.float32)[:,None]*(_e1_pl - _e1_pl**2) + np.float32(SOIL_C_POOL*PLANTATION_SOIL_C)) # (Ng, T_MAX+1) float32
+		warming_g = WPT_MAT_F32 @ cs_pl.T # float32 SGEMM
 		if g == "cunn": est_cost = all_rows_for_one_country["np_cost"][mask_g] if iso == "CHN" else all_rows_for_one_country["ep_cost"][mask_g]
 		elif g == "euca": est_cost = all_rows_for_one_country["ep_cost"][mask_g]
 		else: est_cost = all_rows_for_one_country["exotic"][mask_g] * all_rows_for_one_country["ep_cost"][mask_g] + all_rows_for_one_country["native"][mask_g] * all_rows_for_one_country["np_cost"][mask_g]
-		harv_disc = (1.0 - np.exp(-k_g[:,None] * LENGTHS)) ** 2 / (1.0 + DISCOUNT_RATE) ** LENGTHS # (Ng, N_L)
+		harv_disc = (1.0 - np.exp(-k_g[:,None] * LENGTHS)) ** 2 / COMPOUND_ARR # (Ng, N_L)
 		bid_g = est_cost[:,None] + all_rows_for_one_country["crop_va"][mask_g][:,None] * DISC_ARR - A_g[:,None] * harv_disc # (Ng, N_L)
 		score_g = bid_g.T / warming_g # (N_L, Ng)
 		np.nan_to_num(score_g, nan=np.inf, copy=False)
@@ -274,95 +306,113 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], mac
 		pl_score = score_g[pl_idx, gi]
 		pl_bid = bid_g[gi, pl_idx]
 		better = pl_score < best_score[mask_g]
-		best_option[mask_g] = np.where(better, g, best_option[mask_g])
-		best_length[mask_g] = np.where(better, pl_len.astype(float), best_length[mask_g])
-		best_score[mask_g] = np.where(better, pl_score, best_score[mask_g])
-		best_bid[mask_g] = np.where(better, pl_bid, best_bid[mask_g])
+		if np.any(better):
+			bidx = np.flatnonzero(mask_g)[better]
+			best_option[bidx] = g
+			best_length[bidx] = pl_len[better].astype(float)
+			best_score[bidx]  = pl_score[better]
+			best_bid[bidx]    = pl_bid[better]
+			best_est_cost[bidx] = est_cost[better]
+			best_harvest_at_T[bidx] = A_g[better] * (1.0 - np.exp(-k_g[better] * pl_len[better].astype(float)))**2
 
 	# 3. Output ---------------------------------------------------------------------------------
+	# Compute bids at all four discount rates for the chosen option and contract length.
+	# Contract length was selected using r=0.03; these bids fix that length and vary only the rate,
+	# so downstream scripts (SMDAMAGE) can apply any discount rate without re-optimising.
+	li = np.array([int(np.searchsorted(LENGTHS, int(T))) for T in best_length])  # index into LENGTHS/DISC_ARR_MULTI
+	crop_va = all_rows_for_one_country["crop_va"]
+	# best_bids_multi[ri, n] = est_cost[n] + crop_va[n]*annuity(r_i, T_n) - harvest_at_T[n] / (1+r_i)^T_n
+	best_bids_multi = best_est_cost[None, :] + crop_va[None, :] * DISC_ARR_MULTI[:, li] - best_harvest_at_T[None, :] / COMPOUND_ARR_MULTI[:, li]  # (4, N)
+
+	# Memory: drop columns not needed for CSV output before the valid-mask filter.
+	for _k in list(all_rows_for_one_country):
+		if _k not in KEEP_FOR_OUTPUT: all_rows_for_one_country.pop(_k)
 	# Drop pixels where no valid option was found (best_score = inf means all bids were NaN).
 	valid = np.isfinite(best_score)
 	if not np.all(valid):
-		# n_skip = int((~valid).sum())
-		# print(f" {iso}: {n_skip} pixel(s) with no valid option excluded.", flush=True)
 		best_option = best_option[valid]; best_length = best_length[valid]
 		best_score = best_score[valid]; best_bid = best_bid[valid]
+		best_bids_multi = best_bids_multi[:, valid]
 		for key in list(all_rows_for_one_country.keys()): all_rows_for_one_country[key] = all_rows_for_one_country[key][valid]
 		N = int(valid.sum())
 	if N == 0: return
-	macc_dir.mkdir(parents=True, exist_ok=True)
-	if not SKIP_SQLITE_EXPORT:
-		with sqlite3.connect(macc_dir / SMDAMAGE_DB_FILE) as conn:
-			conn.execute("PRAGMA journal_mode = OFF")
-			conn.execute("PRAGMA synchronous = OFF")
-			conn.execute("PRAGMA cache_size = -131072")
-			ids = all_rows_for_one_country["id"].astype(np.int64)
-			conn.executemany(f"INSERT INTO {SMDAMAGE_PIXEL_TABLE} VALUES (?,?,?,?,?,?,?,?)",
-				zip([iso]*N, ids.tolist(), best_option.tolist(), best_length.astype(int).tolist(), best_bid.tolist(),
-					best_score.astype(int).tolist(), all_rows_for_one_country["area_ha"].tolist(), all_rows_for_one_country["crop_va"].tolist()))
-			nr_A_f = all_rows_for_one_country["nr_A"]
-			nr_k_f = all_rows_for_one_country.get("nr_k", np.zeros(N))
-			nr_rs_f = all_rows_for_one_country["nr_rootshoot"]
-			for opt in np.unique(best_option):
-				mo = best_option == opt
-				if opt == "NR": Av, kv, rsv, soil = nr_A_f[mo], nr_k_f[mo], nr_rs_f[mo], SOIL_C_POOL*NATURAL_SOIL_C
-				else:
-					Av = all_rows_for_one_country[f"{opt}_A"][mo]
-					kv = all_rows_for_one_country[f"{opt}_k"][mo]
-					rsv = all_rows_for_one_country["pl_rootshoot"][mo]
-					soil = SOIL_C_POOL*PLANTATION_SOIL_C
-				gidx = np.flatnonzero(mo)
-				blens = best_length[mo].astype(int)
-				for T in np.unique(blens):
-					sub = blens == T; ts = np.arange(T, dtype=float)
-					As, ks, rss = Av[sub], kv[sub], rsv[sub]
-					cs = (2*As[:, None]*ks[:, None]*(AGB_C_POOL + BGB_C_POOL*rss[:, None]) * (np.exp(-ks[:, None]*ts) - np.exp(-2*ks[:, None]*ts)) + soil) # (n_sub, T)
-					n_sub = cs.shape[0]
-					pids = ids[gidx[sub]]
-					# Speed-up: numpy arrays instead of per-pixel/per-year yield loop;
-					# np.repeat/np.tile build the id and year columns in one call each.
-					conn.executemany(f"INSERT INTO {SMDAMAGE_YEAR_TABLE} VALUES (?,?,?,?)", zip(
-						[iso] * (n_sub * T),
-						np.repeat(pids, T).tolist(),
-						np.tile(np.arange(T, dtype=np.int32), n_sub).tolist(),
-						cs.ravel().tolist()))
 
-# Execute one country pipeline from input .dta to SMDAMAGE exports, streaming in CHUNK_SIZE-row batches.
-def process_country(iso: str, dta_dir: Path, macc_dir: Path) -> None:
+	ids = all_rows_for_one_country["id"].astype(np.int64)
+	nr_A_f = all_rows_for_one_country["nr_A"]
+	nr_k_f = all_rows_for_one_country.get("nr_k", np.zeros(N))
+	nr_rs_f = all_rows_for_one_country["nr_rootshoot"]
+	area_ha_f = all_rows_for_one_country["area_ha"]
+	crop_va_f = all_rows_for_one_country["crop_va"]
+	for opt in set(best_option.tolist()):
+		mo = best_option == opt
+		if opt == "NR": Av, kv, rsv, soil = nr_A_f[mo], nr_k_f[mo], nr_rs_f[mo], SOIL_C_POOL*NATURAL_SOIL_C
+		else:
+			Av = all_rows_for_one_country[f"{opt}_A"][mo]
+			kv = all_rows_for_one_country[f"{opt}_k"][mo]
+			rsv = all_rows_for_one_country["pl_rootshoot"][mo]
+			soil = SOIL_C_POOL*PLANTATION_SOIL_C
+		gidx = np.flatnonzero(mo)
+		blens = best_length[mo].astype(int)
+		for T in np.unique(blens):
+			sub = blens == T
+			As, ks, rss = Av[sub].astype(np.float32), kv[sub].astype(np.float32), rsv[sub].astype(np.float32)
+			_e1_cs = np.exp(-ks[:, None]*TS_ARR_BY_T_F32[T])
+			cs = (2*As[:, None]*ks[:, None]*(np.float32(AGB_C_POOL) + np.float32(BGB_C_POOL)*rss[:, None]) * (_e1_cs - _e1_cs**2) + np.float32(soil))
+			sidx = gidx[sub]  # global pixel indices for this (opt, T) group
+			pids = ids[sidx]
+			writer = csv_writers[T]
+			bids = best_bids_multi[:, sidx]  # (4, n_sub)
+			areas = area_ha_f[sidx]
+			cvas = crop_va_f[sidx]
+			for j in range(len(sidx)):
+				writer.writerow([int(pids[j]), opt, T,
+					float(bids[0, j]), float(bids[1, j]), float(bids[2, j]), float(bids[3, j]),
+					float(areas[j]), float(cvas[j])] + cs[j].tolist())
+
+# Execute one country pipeline from input .dta to CSV output, streaming in CHUNK_SIZE-row batches.
+# pixel_id_start: 1-based global pixel counter accumulated across ALL countries.
+# Returns the updated pixel_id_start after this country's rows are processed.
+# pixel_id is a global counter, not restarting per country, ensuring unique IDs across the full dataset.
+def process_country(iso: str, dta_dir: Path, macc_dir: Path, csv_writers: dict[int, csv.writer], pixel_id_start: int = 0) -> int:
 	filepath = next((c for c in [dta_dir / iso, dta_dir / f"{iso}.dta", dta_dir / f"maps_{iso}.dta"] if c.is_file()), None)
-	if filepath is None: print(f"[SKIP] {iso}: .dta file not found.", flush=True); return
-	pixel_id_offset = 0
+	if filepath is None: print(f"[SKIP] {iso}: .dta file not found.", flush=True); return pixel_id_start
+	pixel_id_offset = pixel_id_start
 	for df in pd.read_stata(str(filepath), chunksize=CHUNK_SIZE, convert_dates=False, convert_categoricals=False):
 		d = {col: np.array(df[col], dtype=float) for col in df.columns}
+		d = {col: arr for col, arr in d.items() if col in KEEP_COLS}
 		n = len(df)
+		# pixel_id continues from the global offset so IDs are unique across all countries.
 		d["id"] = np.arange(pixel_id_offset + 1, pixel_id_offset + n + 1, dtype=float)
 		pixel_id_offset += n
-		process_chunk(iso, d, macc_dir)
+		process_chunk(iso, d, csv_writers)
 	print(f"[OK] {iso} {f'pixel {TARGET_PIXEL_ID}' if RUN_ONLY_ONE_PIXEL else 'all pixels'}", flush=True)
+	return pixel_id_offset
 
 # --- Run all countries in order of increasing .dta file size. -------------------
 # Set RESUME_AFTER_ISO to skip already-processed countries.
 # If RESUME_AFTER_ISO is "", all countries are processed from the start.
-# RESUME_AFTER_ISO = "IND" # seems to do ARG and IND out of order.
+# NOTE: If resuming, pixel IDs will be wrong unless you know the correct global offset
+# for the first country you want to process. Only use "" for a full fresh run.
 RESUME_AFTER_ISO = "" 
 if RESUME_AFTER_ISO:
 	cutoff_src = next((c for c in [DTA_DIR / RESUME_AFTER_ISO, DTA_DIR / f"{RESUME_AFTER_ISO}.dta"] if c.is_file()), None)
 	if cutoff_src is None: raise FileNotFoundError(f"{RESUME_AFTER_ISO}.dta not found in {DTA_DIR}")
 	cutoff_size = cutoff_src.stat().st_size
 	requested_isos = [p.stem.upper() for p in sorted(DTA_DIR.glob("*.dta"), key=lambda p: p.stat().st_size) if p.stat().st_size > cutoff_size]
-
-else:  # do all of them.
+else:
 	requested_isos = [p.stem.upper() for p in sorted(DTA_DIR.glob("*.dta"), key=lambda p: p.stat().st_size)]
 print(f"{len(requested_isos)} countries to process. Starting at {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
-initialize_smdamage_database(MACC_DIR)
+csv_writers, csv_handles = initialize_csv_writers(OUTPUT_CSV_DIR)
+global_pixel_offset = 0
 for iso in requested_isos:
 	size_mb = next((p.stat().st_size / 1e6 for p in DTA_DIR.glob(f"{iso}*.dta") if p.is_file()), 0)
 	t0 = time.perf_counter()
-	try: process_country(iso=iso, dta_dir=DTA_DIR, macc_dir=MACC_DIR)
+	try: global_pixel_offset = process_country(iso=iso, dta_dir=DTA_DIR, macc_dir=OUTPUT_CSV_DIR, csv_writers=csv_writers, pixel_id_start=global_pixel_offset)
 	except Exception as exc:
 		print(f"[FAIL] {iso}: {exc}", flush=True)
 		continue
 	elapsed = time.perf_counter() - t0
 	print(f"  {elapsed:.1f}s / {size_mb:.1f} MB = {elapsed/size_mb:.2f} s/MB", flush=True)
-print(f"End: {time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+for fh in csv_handles.values(): fh.close()
+print(f"End: {time.strftime('%Y-%m-%d %H:%M:%S')}. Total pixels: {global_pixel_offset:,}.", flush=True)

@@ -40,3 +40,102 @@ This keeps SMDAMAGE tractable while preserving heterogeneity in carbon timing, l
 
 4. DONE. Next, export this data to the SMDAMAGE database. Build bidder-specific bid-step curves from per-pixel costs and areas.
 	Switch to the SMDAMAGE project for this.
+
+
+Plan for improving 2_k_means_carbon_removal.py =======================
+Written 2026-07-16.
+
+-------------------------------------------------------------------------------
+Speed switches in run_kmeans
+-------------------------------------------------------------------------------
+
+The algorithm has two direct convergence parameters in RunConfig:
+
+  max_iter (default 4000)
+    Hard cap on iterations. Each iteration is an assign-all-labels pass
+    (O(n*k*T) work) plus a recompute-centers pass. For 10 million pixels and
+    k=15, one iteration takes on the order of seconds.  Reducing to 100–300
+    gives a "fast but approximate" result suitable for the golden-mean k search.
+    Set on the config object or pass directly to run_kmeans().
+
+  tol (default 1e-6)
+    Early-stop threshold: the loop exits when the largest centroid shift is
+    <= tol.  A loose tolerance (1e-2 or 1e-1) stops after very few iterations.
+    A tight tolerance (1e-8) keeps running until centers barely move.
+
+Additional implicit controls:
+
+  k (number of clusters)
+    Fewer clusters = fewer centroid recomputations per iteration = faster.
+    The golden-mean search already exploits this by testing a small range of k.
+
+  chunk_size (hardcoded 16384 in assign_all_labels / assigned_squared_distances)
+    Increasing this reduces Python loop overhead; decreasing it lowers peak
+    memory.  16384 rows * 120 cols * 4 bytes = ~7 MB per chunk, which is fine.
+    Not worth changing unless memory pressure arises.
+
+Recommended fast-pass settings for the golden-mean k search:
+    config.max_iter = 100
+    config.tol = 1e-2
+These give rough SSE estimates 20-40x faster than the default and are accurate
+enough to rank k values relative to each other.
+
+-------------------------------------------------------------------------------
+Balancing error/year across all contract lengths
+-------------------------------------------------------------------------------
+
+Problem: raw SSE scales with the number of years T.  A 120-year contract with
+k=19 clusters can have higher absolute SSE than a 20-year contract with k=15
+clusters even if the 120-year fit is proportionally better.  The fair metric is
+RMSE per year:
+
+    RMSE/year(T, k) = sqrt( SSE(T,k) / (n_pixels(T) * T) )
+
+The current code already computes and reports rmse_per_year for each run.  The
+golden-mean objective log(SSE/n) + lambda*k is agnostic to T, so it does NOT
+produce balanced error/year across contract lengths; it simply minimises a
+per-length penalised SSE independently.
+
+Goal: choose k values for all 11 contract lengths so that RMSE/year is
+approximately equal across all lengths, subject to a total-cluster budget
+N_total = sum of all k_T.
+
+Two-pass algorithm:
+
+Pass 1 — fast sweep at a fixed anchor k
+  For each T in {20, 30, ..., 120}:
+    Run run_kmeans(data_T, k=k_anchor, max_iter=100, tol=1e-2).
+    Record rmse_per_year_T = sqrt(SSE_T / (n_T * T)).
+  k_anchor can be the geometric mean of the current ktarget values (~8).
+  This takes a few minutes for all 11 contract lengths.
+
+Pass 2 — reallocation with fixed total cluster budget
+  Set TARGET_TOTAL_CLUSTERS = 100 (sum of k_T across all 11 contract lengths).
+  Allocate clusters in proportion to each contract length's rmse_per_year_T:
+    weight_T    = rmse_per_year_T                     (higher error → more clusters)
+    k_T_raw     = TARGET_TOTAL_CLUSTERS * weight_T / sum(weight_T)
+    k_T_new     = max(2, round(k_T_raw))              (floor at 2 clusters)
+  Because rounding may shift the sum slightly away from 100, renormalise by
+  adjusting the largest-weight contracts up or down by 1 until the sum is exactly
+  TARGET_TOTAL_CLUSTERS.
+  Contracts with low rmse_per_year_T receive fewer clusters; those with high
+  rmse_per_year_T receive more.  The total cluster count across all lengths is
+  always TARGET_TOTAL_CLUSTERS = 100.
+
+Pass 3 — final full-quality run: For each T, run run_kmeans at k_T_new with max_iter=4000, tol=1e-6. Write results to CSV.
+
+Implementation changes needed in 2_k_means_carbon_removal.py:
+
+1. Add a function run_fast_sweep(csv_dir, contract_list, k_anchor, max_iter, tol)
+   that returns a dict {T: (rmse_per_year, n_pixels)}.
+
+2. Add a function allocate_k(sweep_results, target_total_clusters=100)
+   that applies the proportional allocation above and returns {T: k_new},
+   with the sum of k_new values guaranteed to equal target_total_clusters.
+
+3. Add a function run_final_pass(csv_dir, k_allocation, config) that calls cluster_trees() for each T at its allocated k and writes CSVs.
+
+4. In __main__, replace (or supplement) the golden-mean per-length loop with:
+     sweep = run_fast_sweep(config.csv_dir, contract_list, k_anchor=8, max_iter=100, tol=1e-2)
+     k_alloc = allocate_k(sweep)
+     run_final_pass(config.csv_dir, k_alloc, config)
