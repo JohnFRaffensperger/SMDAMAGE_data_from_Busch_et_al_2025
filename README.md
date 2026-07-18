@@ -1,16 +1,20 @@
 # Busch2024 Data Documentation, John F. Raffensperger, 2026-06-16.
 
-The SMDAMAGE model previously used forestry bids that I took from various places in the literature. Those bids are based on only a few tree types and no land constraints. After seeing Busch et al. (2024), I decided to use their extensive dataset on forestry instead. Their dataset has explicit land constraints and a wide variety of tree types.
+My 2021 paper (corrected 2024) used forestry bids that I took from various places in the literature. I based those bids on only a few tree types and no land constraints. After seeing Busch et al. (2024), I decided to use their extensive dataset on forestry instead. Their dataset has something like 58 million "pixels" representing actual plots of land across the earth. This repository is not the official Busch et al. distribution site. Their publication and data depository are below.
 
-This repository documents my use of the Busch et al dataset. I use this repository for two main purposes:
-- to preserve the methodological lineage from the original Busch et al. (2024) Stata workflow,
-- to document my local export, validation, correction, and schedule-compression work for SMDAMAGE integration.
+My repository here documents my export of the Busch et al dataset for SMDAMAGE integration. My goal is to simulate a land manager at each pixel, show SMDAMAGE prices to the manager, and invite the manager to offer a forestry contract into the SMDAMAGE auction.
 
-This repository is not the official Busch et al. distribution site. Their publication and data depository are below.
+If you use this repository for methodology or downstream integration, I recommend citing both the Busch et al. (2024) paper and the public Zenodo data deposit.
 
-## Publication
+I acknowledge Busch et al for their tremendous work. They produced an excellent data set. My work is better as a result of theirs. I thank them for their effort.
 
-Busch, J., Bukoski, J. J., Cook-Patton, S. C., Griscom, B., Kaczan, D., Potts, M. D., Yi, Y., and Vincent, J. R. (2024). Cost-effectiveness of natural forest regeneration and plantations for climate mitigation. Nature Climate Change, 14(9), 996-1002. https://doi.org/10.1038/s41558-024-02068-1.
+I used Claude to write much of this code. Nevertheless, I take responsibility for all errors in my code.
+
+## Publications
+
+Raffensperger, John F. (2021, 2024) A price on warming with a supply chain directed market. Discover Sustainability 2, 2. https://doi.org/10.1007/s43621-021-00011-4
+
+Busch, J., Bukoski, J. J., Cook-Patton, S. C., Griscom, B., Kaczan, D., Potts, M. D., Yi, Y., and Vincent, J. R. (2024). Cost-effectiveness of natural forest regeneration and plantations for climate mitigation. Nature Climate Change, 14(9), 996-1002. https://doi.org/10.1038/s41558-024-02068-1. Zenodo data deposit: https://doi.org/10.5281/zenodo.11372275
 
 # Data
 
@@ -26,28 +30,30 @@ I organize the top-level folders as follows:
 - `Output/maps/`: original Busch `maps_*.dta` files
 - `JFR code/`: local Python utilities for export, inspection, clustering, and SQLite import.
 - `Output/Databases/Busch2024_dta_outputs.sqlite`: Collected data from Busch's dta files.
+- `Output/Databases/`: intermediate per-contract CSV files from `1a_import_Busch2024_to_SMDAMAGE.py`
 - `Output/Kmeans_temp_files/`: k-means centers, assignments, summary, and overall CSV files
 - `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`: processed Busch data ready for export to SMDAMAGE.
 
 Current scripts follow this structure:
-- `JFR code/1_k_means_carbon_removal.py` writes k-means CSV outputs to `Output/Kmeans_temp_files/`
-- `JFR code/2_import_k_means_csv_to_sqlite.py` reads k-means CSV inputs from `Output/Kmeans_temp_files/` and writes to `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`
+- `JFR code/1a_import_Busch2024_to_SMDAMAGE.py` reads Busch `.dta` inputs and writes one intermediate CSV per contract length to `Output/Databases/`
+- `JFR code/2_k_means_carbon_removal.py` reads those intermediate CSV files and writes k-means outputs to `Output/Kmeans_temp_files/`
+- `JFR code/3_import_k_means_csv_to_sqlite.py` reads k-means CSV inputs from `Output/Kmeans_temp_files/` and writes to `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`
 - `JFR code/4_move_Busch_data_to_SMDAMAGE.py` reads from `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`; its current `__main__` block is a placeholder (`pass`)
 - `JFR code/Old/draw_outputs_graph.py` writes `graph_of_variable_names.svg` to `Output/40_reports/`
 
 ## Quick Start
 
-From the repository root, run the core phase-one pipeline in this order:
-1. Build/refresh the base export database: `python "JFR code/0_import_Busch2024_to_SMDAMAGE.py"`
-2. Build/refresh k-means schedules and assignments: `python "JFR code/1_k_means_carbon_removal.py"`
-3. Import k-means CSV outputs back into SQLite: `python "JFR code/2_import_k_means_csv_to_sqlite.py"`
+To be honest, please don't be hoping for a quick start. From the repository root, run the core phase-one pipeline in this order:
+1. Build/refresh intermediate per-contract CSV exports: `python "JFR code/1a_import_Busch2024_to_SMDAMAGE.py"`
+2. Build/refresh k-means schedules and assignments: `python "JFR code/2_k_means_carbon_removal.py"`
+3. Import k-means CSV outputs into SQLite: `python "JFR code/3_import_k_means_csv_to_sqlite.py"`
 4. (Optional, currently no-op) Run helper code scaffold: `python "JFR code/4_move_Busch_data_to_SMDAMAGE.py"`
 
 The code writes the primary data products to `Output/Databases/` and `Output/Kmeans_temp_files/`.
 
 ## Reproducible Setup Entrypoint
 
-This repository now has a single Python dependency entrypoint: `requirements.txt`.
+This repository has one Python dependency entrypoint: `requirements.txt`.
 One-command setup option (recommended on Windows PowerShell): `./scripts/setup.ps1`
 
 From the repository root on Windows PowerShell:
@@ -59,30 +65,24 @@ From the repository root on Windows PowerShell:
 	- `python -m pip install -r requirements.txt`
 3. Run the pipeline scripts from the Quick Start section above.
 
-## Source-of-truth and local conventions
-
-For methodology questions, I treat the Stata scripts in `DO code/` as the source of truth. The main lineage anchor is: `DO code/1. Model loop all data.do`
-
-The main local Python export lineage anchor is: `JFR code/0_import_Busch2024_to_SMDAMAGE.py`
-
-I also keep a locally corrected Stata file here: `DO code/1. Model loop all data corrected.do`. I include that corrected file because I identified a likely soil-carbon bug in the original `.do` file, described below.
-
-## How I created `Busch2024_to_SMDAMAGE.sqlite`
-
-This section documents the local workflow that I used to create the SMDAMAGE-style SQLite database.
-
-### 1. Obtain the upstream Busch data
+## Busch et al code and data
 
 I start from the Busch et al. Zenodo deposit. My local workflow depends especially on:
-- `08_input_dtas.zip` for the country-level input `.dta` files
-- `12_stata_code.zip` for the original methodological scripts
+- `08_input_dtas.zip` for the country-level input `.dta` files, under `Input/` in this repository.
+- `12_stata_code.zip` for the original methodological scripts, under `DO code/` in this repository.
 - `00_readme_Busch2024.docx` for upstream file descriptions
 
-In this repository, I place the country `.dta` files under `Input/`.
+I treat the Stata scripts in `DO code/` as the source of logic for Busch et al. The main code is `DO code/1. Model loop all data.do`.Their .dta files are my main source of data; their code also contains important constants. I keep a locally corrected Stata file here: `DO code/1. Model loop all data corrected.do`. I include that corrected file because I identified a likely soil-carbon bug in the original `.do` file, described below in "Note on .DO file correction".
 
-### 2. Use the Busch methodology as the reference model
+ ## How I created `Busch2024_to_SMDAMAGE.sqlite`
 
-Busch et al. (2024) compute, for each pixel:
+This section documents my workflow to create the SMDAMAGE SQLite database.
+
+### 1. Calculate carbon schedules and bids, 1a_import_Busch2024_to_SMDAMAGE.py
+
+The first script is: `JFR code/1a_import_Busch2024_to_SMDAMAGE.py`. For each pixel and forestry option, this code calculates the carbon schedule and associated bid. It then chooses the best growing option and contract length based on $bid/(°C warming).
+
+For each pixel, Busch et al calculate the following:
 - admissibility after biome and data-quality filtering
 - natural-regeneration and plantation carbon accumulation
 - root-to-shoot adjustments and soil-carbon terms
@@ -91,174 +91,47 @@ Busch et al. (2024) compute, for each pixel:
 - branch-level cost-effectiveness for natural regeneration versus plantation
 - the selected lower-cost option for each pixel
 
-In the original Stata workflow, Busch et al. (2024) set a 30-year horizon and a 5% discount rate. In my local SMDAMAGE export pipeline, I preserve the same overall economic logic but use a 35-year export horizon in the Python implementation.
+In the original Stata workflow, Busch et al set a 30-year horizon and a 5% discount rate. Their main output is the $/ton C and then the resulting marginal abatement cost curves for forestry.
 
-### 3. Run my local Python export pipeline
+But SMDAMAGE does not price by $/ton C. It prices on warming at the dealine of 2125. I therefore do a different pricing calculation that accounts for the warming (actually cooling) of the proposed planting plan. Using 1a_import_Busch2024_to_SMDAMAGE.py on each pixel and growing option, I calculate the carbon removal schedule similar to how Busch et al did it; I found the derivative of their cumulative carbon function. Then I choose a contract length based on minimizing $bid/(°C warming), taking care with present values, etc. This is how a land manager would decide how to bid into the SMDAMAGE auction. This pricing mechanism is itself an important contribution.
 
-The main local export script is: `JFR code/0_import_Busch2024_to_SMDAMAGE.py`
+1a_import_Busch2024_to_SMDAMAGE.py:
+- reads country `.dta` files,
+- applies Busch et al data cleaning and biome filters,
+- computes carbon-removal schedules for natural regeneration and plantation options,
+- evaluates bids and bid scores across contract lengths 20, 30, ..., 120 years,
+- chooses each pixel's best option and best contract length,
+- write a CSV file for each contract length to `Output/Databases/undiscounted_contracts_XXX.csv`. I decided to write output to CSV files before SQLite import to keep the heavy numeric pass simple, memory-safe, and restartable. The code streams to CSV, which is lighter than writing to SQLite which needs indexing.
 
-That script is a local downstream export layer. Claude helped me write parts of this Python code during my repository work, but the script follows the Busch et al. methodological structure rather than replacing it.
+### 2. Clustering of pixels, 2_k_means_carbon_removal.py
 
-In that script, I:
-- read country `.dta` files with `pandas.read_stata`
-- filter out excluded biomes and invalid rows
-- convert `area_m2` to `area_ha`
-- inflate the Busch cost inputs from 2011 USD to 2020 USD
-- map plantation `type` codes to a working genus
-- assign continent and ecological-zone root-to-shoot ratios
-- compute annual carbon schedules for natural regeneration and plantation options
-- compute plantation harvest years using a Faustmann-style rule and then bucket them to a smaller set of rotation years for downstream tractability
-- compare cost-effectiveness and select the lower-cost pixel-level option
-- write one row per pixel to `Undiscounted_dta_output`
-- write one row per pixel-year to `tC_per_h_per_year`
+A Busch et al pixel is a plot of land. We can think of that plot as a bidder in SMDAMAGE. 1a_import_Busch2024_to_SMDAMAGE.py finds that bidder's best bid for SMDAMAGE. But 58 million bidders is too big for SMDAMAGE, so I use a k-means to cluster pixels into 100 groups,
+based on carbon schedule, treating them as identical within the group, except for bid.
 
-The export script initializes the database with two main tables:
-- `Undiscounted_dta_output`
-- `tC_per_h_per_year`
+The code writes the solution to CSV files. (I will import into Busch2024_to_SMDAMAGE.sqlite with the cleverly named program 3_import_k_means_csv_to_sqlite.py, next). This code can run out of memory. It is fiddly to run. I finally got a satisfactory run 
+that took about 18 hours to run. I think the limiting factor was 8GB RAM when I wish I had 64GB RAM, 
+resulting in caching to the solid state drive. Claude was helpful in getting it to run faster and use less memory.
 
-Key pixel-level export fields include:
+2_k_means_carbon_removal.py:
+- reads `undiscounted_contracts_XXX.csv` by contract length,
+- runs a sweep-based k-allocation pass to estimate error as a function of cluster count,
+- chooses the cluster count for each contract length based on marginal error, with 100 total clusters across all contract lengths,
+- runs the final k-means pass for each contract length,
+- writes cluster centers and assignments to CSV files in `Output/Kmeans_temp_files/`
 
-- `country`
-- `pixel_id`
-- `plantation_genus`
-- `selected_option`
-- `selected_A`
-- `selected_k`
-- `selected_rotation_year`
-- `area_ha`
-- `crop_va_USD_per_ha_per_year`
-- `selected_establishment_cost_USD_per_ha`
-- `p_USD_per_tC_harvested`
+Later in the workflow, SMDAMAGE project file create_database.py reads Busch2024_to_SMDAMAGE.sqlite
+and loads forestry bidders, one per group, into the SMDAMAGE auction.
 
-### 4. Net present value and discounting details
+### 3. Import clustered outputs into SQLite, 3_import_k_means_csv_to_sqlite.py
 
-Busch et al. (2024) combine biological growth with discounted economic terms. In my local export, I keep that structure but store the final carbon schedules in undiscounted annual form for downstream use in SMDAMAGE.
+`JFR code/3_import_k_means_csv_to_sqlite.py` imports the k-means CSV outputs into `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`, populates clustered schedule tables, and writes per-pixel cluster assignments for downstream SMDAMAGE integration.
 
-Important local constants in my Python export are:
+## Note on .DO file correction
 
-- `TIME_HORIZON_YEARS = 35`
-- `DISCOUNT_RATE = 0.05`
+In my local review, I identified one likely methodological error in the original `DO code/1. Model loop all data.do`. In their section labeled `Discounted present value of soil carbon, w/harvest`, the original file contains: `replace nr_soilC=nr_soilC + (1-d)^(`i'-1) * nrsoil`.
 
-I use the discount rate in two main ways:
+I interpret the original line as reusing the natural-regeneration soil-carbon increment `nrsoil` inside the with-harvest loop, where plantation soil-carbon logic was intended. That would bias the comparison between natural regeneration and plantation cases by using the wrong soil-carbon parameter in the harvest branch. I raised this `.do`-file issue in correspondence with the Busch paper authors, and they graciously responded. 
 
-- to choose harvest years using a Faustmann-style decision rule
-- to carry forward the Busch logic for recurring plantation establishment costs and discounted comparison logic
-
-The key plantation-with-harvest cost-effectiveness expression in my local export is:
-
-`pl_whrv_costeff_USD_per_tCO2 = (crop_va * Y + pl_npv_estcost_USD_per_ha - p * pl_harvested_tC_per_ha) / (3.67 * pl_whrv_total_tC_per_ha)`
-
-I interpret that expression as follows:
-
-- `crop_va * Y` is the per-hectare opportunity-cost term over the modeled horizon
-- `pl_npv_estcost_USD_per_ha` is the plantation establishment-cost term produced by the Busch logic
-- `p * pl_harvested_tC_per_ha` is the harvest-revenue offset
-- `3.67` converts tons of carbon to tons of CO2
-
-For natural regeneration, I use the analogous cost expression with `nr_cost` instead of the plantation establishment-cost term and without a harvest-revenue offset.
-
-Important note:
-- the harvest revenue term is not a bare subtraction of `p`
-- it is `p` multiplied by harvested carbon per hectare
-
-### 5. Local run mode used in this repository
-
-In this repository, I configure the export script to run all available country files from `Input/` and to write directly to `Output/Databases/Busch2024_to_SMDAMAGE.sqlite`.
-
-The relevant script settings are:
-- `RUN_ALL_PIXELS = True`
-- `SKIP_SQLITE_EXPORT = False`
-- inline settings that iterate all `.dta` files in `Input/`
-
-### 6. Post-export clustering work
-
-After I created the SMDAMAGE-style SQLite database, I added a schedule-compression workflow to reduce the number of forestry schedules.
-
-Relevant scripts:
-- `JFR code/3_choose_harvest_years.py`
-- `JFR code/1_k_means_carbon_removal.py`
-- `JFR code/2_import_k_means_csv_to_sqlite.py`
-
-I used JFR code/1_k_means_carbon_removal.py to compress pixel-level carbon-removal schedules into forestry bidders for SMDAMAGE.
-The k-means algorithm clustered pixels within each selected_rotation_year on year-by-year tC_per_ha_per_year profiles.
-
-I then used JFR code/2_import_k_means_csv_to_sqlite.py to load those cluster centers and assignments into Output/Databases/Busch2024_to_SMDAMAGE.sqlite.
-The database stores the cluster centers in table carbon_removal_schedules and each pixel receives a cluster_index.
-
-Next, I used JFR code/4_move_Busch_data_to_SMDAMAGE.py to export bidder metadata (forestry_bidder_metadata.csv)
-and bidder-specific bid-step curves (forestry_bid_steps_long.csv) from per-pixel costs and areas.
-
-In that export step, each (rotation_year, cluster_index) pair is one bidder, summed area becomes available_area_mhectares,
-and bid steps are built by sorting per-pixel bid_cost_per_ha and accumulating area.
-
-This keeps SMDAMAGE tractable while preserving heterogeneity in carbon timing, land availability, and costs.
-
-As of 2026-04-18, this clustered schedule import produced 71 forestry schedules distributed across rotation years 6, 10, 17, and 35,
-and I used it to write schedule rows into `carbon_removal_schedules` and assign `cluster_index` values in `Undiscounted_dta_output`.
-
-## Summary of the original `.do`-file issue
-In my local review, I identified one likely methodological error in the original `DO code/1. Model loop all data.do`.
-
-In the section labeled `Discounted present value of soil carbon, w/harvest`, the original file contains:
-`replace nr_soilC=nr_soilC + (1-d)^(`i'-1) * nrsoil`
-
-In my corrected file, I change that line to:
-`replace nr_soilC=nr_soilC + (1-d)^(`i'-1) * plantsoil`
-
-I interpret the original line as reusing the natural-regeneration soil-carbon increment `nrsoil` inside the with-harvest loop, where plantation soil-carbon logic was intended. That would bias the comparison between natural regeneration and plantation cases by using the wrong soil-carbon parameter in the harvest branch.
-
-I preserve that local correction in: `DO code/1. Model loop all data corrected.do`
-
-## Note on correspondence with the authors
-
-I raised this `.do`-file issue in correspondence with the Busch paper authors. This repository does not include private emails or a verbatim correspondence archive, so I limit the public summary to the following:
-- I identified a likely soil-carbon issue in the original Stata code
-- the issue concerns the use of `nrsoil` versus `plantsoil` in the with-harvest soil-carbon loop
-- I preserve a locally corrected `.do` file reflecting that change
-
-If I later add a fuller correspondence record to the repository, I should update this section to cite that record directly.
-
-## Plan for bringing the data into SMDAMAGE
-
-This section summarizes my current working state in this repository as of phase one.
-
-Current status from my latest workflow notes:
-1. DONE: create the Busch SQLite export with pixel-level economics and annual carbon schedules.
-2. DONE: compress pixel-level carbon-removal schedules with k-means and import cluster centers/assignments back into SQLite.
-3. DONE: build bidder-specific forestry bid curves by `(selected_rotation_year, cluster_index)` from per-pixel costs and areas.
-4. NEXT: move to the SMDAMAGE repository and complete ingestion/refactor there.
-
-The key integration direction remains to replace the legacy fixed forestry layout in SMDAMAGE with bidder-specific long-format forestry inputs. Practical SMDAMAGE-side targets are:
-- one forestry bidder per `(selected_rotation_year, cluster_index)` pair
-- explicit bidder metadata (rotation year, contract years, available area)
-- bidder-specific bid-step rows instead of a single shared wide grid
-- bidder-specific sequestration schedules
-- bidder-specific land-cap constraints in the optimization model
-
-In short, my intended SMDAMAGE integration path is:
-1. use the Busch SQLite export as the per-pixel source table
-2. use clustered schedules from `carbon_removal_schedules`
-3. construct long-format forestry bidder metadata, bid-step, and sequestration tables
-4. refactor SMDAMAGE input loading to support those long-format forestry tables
-5. replace the aggregate forestry land constraint with bidder-specific land caps
-
-## Reproducibility notes
-
-I use this repository as a working research repository rather than as a polished upstream software package. Reproducibility depends on keeping several lineage distinctions clear.
-
-- `Busch2024_dta_outputs.sqlite` and `Busch2024_to_SMDAMAGE.sqlite` are different databases with different purposes
-- the Stata `.do` files remain the methodological anchor for Busch et al. (2024)
-- my Python export and k-means scripts are downstream transformation layers
-- Claude wrote or helped write some of my local Python utilities, but I used those utilities to implement and inspect the Busch et al. logic rather than to redefine it
-- my local corrections and downstream integration steps need explicit documentation because they are not part of the original Busch et al. release by default
-
-## Recommended citation practice
-
-If you use this repository for methodology or downstream integration, I recommend citing both the Busch et al. (2024) paper and the public Zenodo data deposit:
-
-- Paper: https://doi.org/10.1038/s41558-024-02068-1
-- Data: https://doi.org/10.5281/zenodo.11372275
-
-If you rely on my local corrections or my downstream SMDAMAGE integration work in this repository, cite the relevant repository snapshot separately in your own publication workflow.
+In my corrected file, I change that line to: `replace nr_soilC=nr_soilC + (1-d)^(`i'-1) * plantsoil`. I preserve that local correction in: `DO code/1. Model loop all data corrected.do`.
 
 JFR 16 June 2026, john.raffensperger@gmail.com, john.raffensperger.org.

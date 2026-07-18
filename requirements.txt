@@ -2,6 +2,8 @@
 numpy>=2.0,<3.0
 pandas>=2.2,<3.0
 openpyxl>=3.1,<4.0
+scikit-learn>=1.6,<2.0
+scikit-learn-intelex-gpu>=2026.1.0,<2027.0
 
 # Optional dependency: used by JFR code/Old/draw_outputs_graph.py if available
 scipy>=1.14,<2.0

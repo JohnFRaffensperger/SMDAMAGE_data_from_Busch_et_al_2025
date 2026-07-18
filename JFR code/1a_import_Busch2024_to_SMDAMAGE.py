@@ -1,4 +1,5 @@
 ﻿# 1a_import_Busch2024_to_SMDAMAGE.py — Written by JFR and CoPilot (mostly Claude), 2026-07-14.
+
 # Purpose: Busch2024_to_SMDAMAGE.sqlite is the data bridge between the Busch 2024 paper ".dta" files and SMDAMAGE.
 # Each pixel in each .dta file is treated as a bidder. Each bidder chooses a most profitable crop
 # (natural regeneration or some plantation crop), the associated carbon removal schedule and a bid price to the SMDAMAGE auction.
