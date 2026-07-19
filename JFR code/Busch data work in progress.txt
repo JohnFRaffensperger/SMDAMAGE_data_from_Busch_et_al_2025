@@ -1,29 +1,115 @@
 ## Plan for bringing the data into SMDAMAGE
 
-Current status from my latest workflow notes:
-1. DONE: create the Busch SQLite export with pixel-level economics and annual carbon schedules.
-2. DONE: compress pixel-level carbon-removal schedules with k-means and import cluster centers/assignments back into SQLite.
-3. DONE: build bidder-specific forestry bid curves by `(selected_rotation_year, cluster_index)` from per-pixel costs and areas.
-4. NEXT: move to the SMDAMAGE repository and complete ingestion/refactor there.
-- construct long-format forestry bidder metadata, bid-step, and sequestration tables
-- update the forestry land constraint to have one land constraint per year over all running contracts.
+## Current state (2026-07-18)
+1. DONE: `1a_import_Busch2024_to_SMDAMAGE.py` ran successfully and produced `undiscounted_contracts_020.csv` ... `undiscounted_contracts_120.csv`.
+2. DONE: `2_k_means_carbon_removal.py` ran successfully and produced `k_means_carbon_removal_contract_years_*` centers/assignments/summary/overall files.
+3. NEXT: rebuild the SQLite bridge from these CSV outputs, then rebuild forestry bid curves for SMDAMAGE.
 
-I used JFR code/4_move_Busch_data_to_SMDAMAGE.py to export bidder metadata (forestry_bidder_metadata.csv) 
-and bidder-specific bid-step curves (forestry_bid_steps_long.csv) from per-pixel costs and areas. 
-In that export step, each (rotation_year, cluster_index) pair is one bidder, summed area becomes available_area_mhectares, 
-and bid steps are built by sorting per-pixel bid_cost_per_ha and accumulating area. 
-This keeps SMDAMAGE tractable while preserving heterogeneity in carbon timing, land availability, and costs.
+## Old `Old Busch2024_to_SMDAMAGE.sqlite` schema
+1. `Undiscounted_dta_output`: country, pixel_id, plantation_genus, selected_option, selected_A, selected_k, selected_rotation_year, area_ha, 
+crop_va_USD_per_ha_per_year, selected_establishment_cost_USD_per_ha, p_USD_per_tC_harvested, NPV_0_pct_per_ha, NPV_015_pct_per_ha, NPV_03_pct_per_ha, NPV_06_pct_per_ha, selected_rotation_year_int.
+2. `tC_per_h_per_year`: country, pixel_id, year, tC_per_ha_per_year
+3. `carbon_removal_schedules`: selected_rotation_year, cluster_index, year, tC_per_ha_per_year, pixel_count, total_area_ha
+4. `forestry_bid_curves`: selected_rotation_year_int, cluster_index, discount_rate, bucket_id, npv_column, npv_min_per_ha, npv_max_per_ha, area_ha_sum, bucket_area_share.
 
-For each bin, I create a bid curve based on cost per hectare and area. 
-	Convert cost to $millions/million ha, and convert area to millions of hectares.
-	Function write_bid_steps_for_cluster exports bid curves for each (rotation_year, cluster_index).
+## New Busch2024_to_SMDAMAGE.sqlite schema 
+1. `Pixel_bids`: int pixel_id, int cluster_id, text selected_option, int contract_years, float area_ha, float NPV_0_pct_per_ha, float NPV_015_pct_per_ha, float NPV_03_pct_per_ha, float NPV_06_pct_per_ha.
+2. `cluster_carbon_schedules_{years}`, one table for each contract year length: int cluster_id, int growth_year, float tC_per_ha_per_year.
+3. `cluster_forestry_bid_curves_{years}`, one table for each contract year length: int cluster_id, int discount_rate_00 in [0, 15, 30, 60], int bid_step, float npv_max_per_ha, float step_area_ha.
 
-Finally, export this data to the SMDAMAGE database. Build bidder-specific bid-step curves from per-pixel costs and areas.
-	Switch to the SMDAMAGE project for this.
+## Script responsibilities and why both are needed
 
-The key integration direction remains to replace the legacy fixed forestry layout in SMDAMAGE with bidder-specific long-format forestry inputs. Practical SMDAMAGE-side targets are:
-- one forestry bidder per `(selected_rotation_year, cluster_index)` pair
-- explicit bidder metadata (rotation year, contract years, available area)
-- bidder-specific bid-step rows instead of a single shared wide grid
-- bidder-specific sequestration schedules
-- bidder-specific land-cap constraints in the optimization model
+1. `3_import_k_means_csv_to_sqlite.py` is the loader and schema-builder.
+2. `4_move_Busch_data_to_SMDAMAGE.py` is the bid-curve builder and exporter.
+
+Keep them separate so I can rerun imports without recomputing bid curves, and rerun bid curves without rebuilding all tables.
+
+### Quick input/output summary
+1. `3_import_k_means_csv_to_sqlite.py`
+	- Inputs: `undiscounted_contracts_*.csv` and `k_means_carbon_removal_contract_years_*` assignments/centers/summary CSV files.
+	- Outputs: refreshed SQLite `Pixel_bids` plus rebuilt `cluster_carbon_schedules_{years}` tables, with `cluster_id` populated in `Pixel_bids`.
+2. `4_move_Busch_data_to_SMDAMAGE.py`
+	- Inputs: SQLite `Pixel_bids` (including `cluster_id`, `contract_years`, `area_ha`, and `NPV_*_per_ha`).
+	- Outputs: rebuilt SQLite `cluster_forestry_bid_curves_{years}` tables and run-time checks/logs for row counts and bid monotonicity.
+
+## Required changes to script 3 (loader)
+
+### Scope
+`3_import_k_means_csv_to_sqlite.py` should read:
+1. `undiscounted_contracts_*.csv`
+2. `k_means_carbon_removal_contract_years_*_assignments.csv`
+3. `k_means_carbon_removal_contract_years_*_centers.csv`
+4. `k_means_carbon_removal_contract_years_*_summary.csv`
+
+### Table build rules
+1. Build `Pixel_bids` from `undiscounted_contracts_*.csv`.
+	- `pixel_id <- pixel_id`
+	- `selected_option <- option`
+	- `contract_years <- best_contract_length`
+	- `area_ha <- area_ha`
+	- `NPV_0_pct_per_ha <- bid_r000`
+	- `NPV_015_pct_per_ha <- bid_r015`
+	- `NPV_03_pct_per_ha <- bid_r030`
+	- `NPV_06_pct_per_ha <- bid_r060`
+
+2. Build one carbon table per contract length:
+	- `cluster_carbon_schedules_{years}`
+	- source: centers CSV (`cluster_id`, `year_1..year_T`)
+	- output rows: `(cluster_id, growth_year, tC_per_ha_per_year)`
+
+3. Update `Pixel_bids.cluster_id` from assignments CSV:
+	- assignments columns: `contract_years`, `pixel_id`, `cluster_id`
+	- join key: `(pixel_id, contract_years)`
+	- rule: every imported pixel row must receive one cluster_id
+
+4. Table lifecycle rule:
+	- clear and rebuild `Pixel_bids`
+	- drop/recreate `cluster_carbon_schedules_{years}` tables for all years present
+	- this avoids stale rows from prior runs
+
+### Verification checks in script 3
+1. For each `{years}`, assignment row count equals `Pixel_bids` row count where `contract_years={years}`.
+2. For each `{years}`, distinct `cluster_id` count in centers equals summary equals assignments.
+3. For each `{years}`, all assignment `pixel_id` values exist in `Pixel_bids` for the same `contract_years`.
+4. In `Pixel_bids`, `(pixel_id, contract_years)` is unique.
+5. After assignment update, no null `cluster_id` remains in `Pixel_bids`.
+
+## Required changes to script 4 (bid curves)
+
+### Scope
+`4_move_Busch_data_to_SMDAMAGE.py` should read `Pixel_bids` and write `cluster_forestry_bid_curves_{years}`.
+
+### Core logic
+1. Do not recompute NPV from establishment cost or harvest-value components.
+2. Use `NPV_*_per_ha` from `Pixel_bids` as authoritative cost inputs.
+3. For each `years` and each `cluster_id`, sort pixels by NPV and bucket by area share.
+4. Keep current default rule:
+	- bucket size: 3% of area
+	- omit top-cost tail: 1% of area
+5. Write rows as:
+	- `cluster_id`
+	- `discount_rate_00` in `{0, 15, 30, 60}`
+	- `bid_step`
+	- `npv_max_per_ha`
+	- `step_area_ha`
+
+### Run entrypoint
+Add one main run path that:
+1. discovers contract years from `Pixel_bids`
+2. rebuilds `cluster_forestry_bid_curves_{years}`
+3. logs row counts by `(years, discount_rate_00)`
+4. verifies monotonicity per curve (non-decreasing `npv_max_per_ha` by `bid_step`)
+
+## Execution order
+1. Run `1a_import_Busch2024_to_SMDAMAGE.py` (already done).
+2. Run `2_k_means_carbon_removal.py` (already done).
+3. Run updated `3_import_k_means_csv_to_sqlite.py`.
+4. Run updated `4_move_Busch_data_to_SMDAMAGE.py`.
+5. Export or connect these tables into SMDAMAGE.
+
+## SMDAMAGE-side integration target
+1. Bidder identity: `(contract_years, cluster_id)`.
+2. Carbon schedule: `cluster_carbon_schedules_{years}`.
+3. Bid steps: `cluster_forestry_bid_curves_{years}`.
+4. Area cap basis: sum of `Pixel_bids.area_ha` by `(contract_years, cluster_id)`.
+5. Land constraints: enforce overlap across active contract vintages.

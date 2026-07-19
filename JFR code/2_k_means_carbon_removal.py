@@ -3,7 +3,7 @@
 # A Busch et al pixel is a plot of land. We can think of that plot as a bidder in SMDAMAGE.
 # 1a_import_Busch2024_to_SMDAMAGE.py finds that bidder's best bid for SMDAMAGE.
 
-# But 58 million bidders is too big for SMDAMAGE, so I use a k-means to cluster pixels into 100 groups,
+# But 89 million bidders is too big for SMDAMAGE, so I use a k-means to cluster pixels into 100 groups,
 # based on carbon schedule, treating them as identical within the group, except for bid.
 # The code writes the solution to CSV files, which I will import into Busch2024_to_SMDAMAGE.sqlite
 # with the cleverly named program 3_import_k_means_csv_to_sqlite.py.

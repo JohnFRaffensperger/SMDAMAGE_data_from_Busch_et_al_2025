@@ -3,7 +3,7 @@
 # Purpose: Busch2024_to_SMDAMAGE.sqlite is the data bridge between the Busch 2024 paper ".dta" files and SMDAMAGE.
 # Each pixel in each .dta file is treated as a bidder. Each bidder chooses a most profitable crop
 # (natural regeneration or some plantation crop), the associated carbon removal schedule and a bid price to the SMDAMAGE auction.
-# But 58 million bidders is too big for SMDAMAGE, so I use a k-means to cluster similar bidders into groups.
+# But 89 million bidders is too big for SMDAMAGE, so I use a k-means to cluster similar bidders into groups.
 # Later in the workflow, SMDAMAGE project file create_database.py reads Busch2024_to_SMDAMAGE.sqlite
 # and loads forestry bidders, one per group, into the SMDAMAGE auction.
 
@@ -151,7 +151,7 @@ COMPOUND_ARR = (1.0 + DISCOUNT_RATE) ** LENGTHS # Compound factors at r=0.03 use
 RATES = np.array([0.00, 0.015, 0.03, 0.06])
 DISC_ARR_MULTI = np.where(RATES[:, None] == 0.0, LENGTHS[None, :].astype(float), (1.0 - (1.0 + RATES[:, None])**(-LENGTHS[None, :])) / RATES[:, None])  # (4, N_L)
 COMPOUND_ARR_MULTI = (1.0 + RATES[:, None])**LENGTHS[None, :]  # (4, N_L)
-TS_ARR_BY_T   = {int(T): np.arange(T, dtype=float)    for T in LENGTHS} # Pre-built year arrays for year-table output.
+TS_ARR_BY_T   = {int(T): np.arange(1, T + 1, dtype=float) for T in LENGTHS} # Pre-built year arrays for year-table output (year 1..T).
 YEAR_ARR_BY_T   = {int(T): np.arange(T, dtype=np.int32) for T in LENGTHS}
 WPT_MAT_F32     = WPT_MAT.astype(np.float32)     # float32 for SGEMM (~2x faster than DGEMM).
 T_ARR_F32       = T_ARR.astype(np.float32)
@@ -296,7 +296,7 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], csv
 		if g == "cunn": est_cost = all_rows_for_one_country["np_cost"][mask_g] if iso == "CHN" else all_rows_for_one_country["ep_cost"][mask_g]
 		elif g == "euca": est_cost = all_rows_for_one_country["ep_cost"][mask_g]
 		else: est_cost = all_rows_for_one_country["exotic"][mask_g] * all_rows_for_one_country["ep_cost"][mask_g] + all_rows_for_one_country["native"][mask_g] * all_rows_for_one_country["np_cost"][mask_g]
-		harv_disc = (1.0 - np.exp(-k_g[:,None] * LENGTHS)) ** 2 / COMPOUND_ARR # (Ng, N_L)
+		harv_disc = HARVEST_C_POOL * (1.0 - np.exp(-k_g[:,None] * LENGTHS)) ** 2 / COMPOUND_ARR # (Ng, N_L)
 		bid_g = est_cost[:,None] + all_rows_for_one_country["crop_va"][mask_g][:,None] * DISC_ARR - A_g[:,None] * harv_disc # (Ng, N_L)
 		score_g = bid_g.T / warming_g # (N_L, Ng)
 		np.nan_to_num(score_g, nan=np.inf, copy=False)
@@ -314,7 +314,7 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], csv
 			best_score[bidx]  = pl_score[better]
 			best_bid[bidx]    = pl_bid[better]
 			best_est_cost[bidx] = est_cost[better]
-			best_harvest_at_T[bidx] = A_g[better] * (1.0 - np.exp(-k_g[better] * pl_len[better].astype(float)))**2
+			best_harvest_at_T[bidx] = HARVEST_C_POOL * A_g[better] * (1.0 - np.exp(-k_g[better] * pl_len[better].astype(float)))**2
 
 	# 3. Output ---------------------------------------------------------------------------------
 	# Compute bids at all four discount rates for the chosen option and contract length.
@@ -359,6 +359,7 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], csv
 			As, ks, rss = Av[sub].astype(np.float32), kv[sub].astype(np.float32), rsv[sub].astype(np.float32)
 			_e1_cs = np.exp(-ks[:, None]*TS_ARR_BY_T_F32[T])
 			cs = (2*As[:, None]*ks[:, None]*(np.float32(AGB_C_POOL) + np.float32(BGB_C_POOL)*rss[:, None]) * (_e1_cs - _e1_cs**2) + np.float32(soil))
+			if opt != "NR": cs[:, -1] -= np.float32(HARVEST_C_POOL) * As * (1.0 - np.exp(-ks * np.float32(T)))**2
 			sidx = gidx[sub]  # global pixel indices for this (opt, T) group
 			pids = ids[sidx]
 			writer = csv_writers[T]
