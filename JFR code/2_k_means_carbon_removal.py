@@ -29,11 +29,21 @@
 	# 110	756,737		67,899,812		4	5
 	# 120	18,463,262	1,578,573,429	19	16
 
+# I ran this at the command line rather than within VSCode. To use the GPU, it needed the .venv environment. Claude made this batch file.
+# 		setlocal
+# 		cd /d "%~dp0"
+# 		set "PY=..\.venv\Scripts\python.exe"
+# "		%PY%" "2_k_means_carbon_removal.py" %*
+# 		endlocal
+
+
 from __future__ import annotations
 import csv
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from typing import Callable, Iterator, cast
@@ -54,6 +64,12 @@ DEFAULT_OUTPUT_PREFIX = KMEANS_DIR / "k_means_carbon_removal"
 FAST_SWEEP_CHUNK_SIZE = 25000
 FAST_SWEEP_SAMPLE_PER_CHUNK = 128
 
+_offload_probe_cache: dict[str, tuple[bool, str]] = {}
+_offload_probe_logged: set[str] = set()
+_runtime_probe_logged = False
+_offload_force_cpu: set[str] = set()
+_offload_force_cpu_logged: set[str] = set()
+
 @dataclass(slots=True)
 class RunConfig:
 	csv_dir: Path = DEFAULT_CSV_DIR
@@ -64,10 +80,15 @@ class RunConfig:
 	seed: int = 0
 	normalize: bool = False
 	sklearnex_target_offload: str = "gpu"
-	allow_cpu_fallback: bool = False
+	oneapi_device_selector: str = "opencl:gpu"
+	allow_cpu_fallback: bool = False # True
 	gpu_fit_sample_rows: int = 20_000
 	gpu_progressive_stage_rows: tuple[int, ...] = (2_000, 5_000, 10_000, 20_000, 50_000)
 	csv_chunk_size: int = 100_000
+	low_memory_contract_year: int = 120
+	low_memory_csv_chunk_size: int = 50_000
+	default_center_block_size: int = 32
+	low_memory_center_block_size: int = 16
 	sample_strata_count: int = 8
 	sample_sketch_per_chunk: int = 256
 	write_to_CSV: bool = True
@@ -78,8 +99,7 @@ class RunConfig:
 
 CONFIG = RunConfig()
 
-def year_columns(contract_year: int) -> list[str]:
-	return [f"year{y}" for y in range(1, contract_year + 1)]
+def year_columns(contract_year: int) -> list[str]: return [f"year{y}" for y in range(1, contract_year + 1)]
 
 def l2_normalize_rows(data: np.ndarray) -> np.ndarray:
 	norms = np.linalg.norm(data, axis=1, keepdims=True)
@@ -96,15 +116,25 @@ def assigned_squared_distances(data: np.ndarray, centers: np.ndarray, labels: np
 		distances[start:stop] = np.sum(delta*delta, axis=1)
 	return distances
 
-def assign_labels_to_centers(data: np.ndarray, centers: np.ndarray, chunk_size: int = 131072) -> np.ndarray:
+def assign_labels_to_centers(data: np.ndarray, centers: np.ndarray, chunk_size: int = 131072, center_block_size: int = 32) -> np.ndarray:
 	labels = np.empty(len(data), dtype=np.int32)
-	center_sq = np.sum(centers*centers, axis=1)
+	center_sq = np.sum(centers*centers, axis=1).astype(np.float32, copy=False)
 	for start in range(0, len(data), chunk_size):
 		stop = min(start + chunk_size, len(data))
 		chunk = data[start:stop]
-		chunk_sq = np.sum(chunk*chunk, axis=1, keepdims=True)
-		d2 = chunk_sq + center_sq[np.newaxis, :] - 2.0*chunk @ centers.T
-		labels[start:stop] = np.argmin(d2, axis=1)
+		chunk_sq = np.sum(chunk*chunk, axis=1, keepdims=True).astype(np.float32, copy=False)
+		best_d2 = np.full(len(chunk), np.inf, dtype=np.float32)
+		best_labels = np.zeros(len(chunk), dtype=np.int32)
+		for c_start in range(0, len(centers), center_block_size):
+			c_stop = min(c_start + center_block_size, len(centers))
+			center_block = centers[c_start:c_stop]
+			d2 = chunk_sq + center_sq[np.newaxis, c_start:c_stop] - 2.0*chunk @ center_block.T
+			block_argmin = np.argmin(d2, axis=1)
+			block_best = d2[np.arange(len(chunk)), block_argmin]
+			improved = block_best < best_d2
+			best_d2[improved] = block_best[improved]
+			best_labels[improved] = c_start + block_argmin[improved]
+		labels[start:stop] = best_labels
 	return labels
 
 def iter_schedule_chunks(csv_dir: Path, contract_year: int, normalize: bool, chunk_size: int = 100_000) -> Iterator[tuple[np.ndarray, np.ndarray]]:
@@ -137,9 +167,11 @@ def build_stratified_training_sample(csv_dir: Path, contract_year: int, normaliz
 	if len(sketch) == 0: return np.empty((0, contract_year), dtype=np.float32)
 	quantiles = np.linspace(0.0, 1.0, strata_count + 1)
 	edges = np.quantile(sketch, quantiles)
-	per_chunk_budget = max(1, int(np.ceil(target_rows / chunk_count)))
-	per_stratum_budget = max(1, int(np.ceil(per_chunk_budget / strata_count)))
-	sampled_chunks: list[np.ndarray] = []
+	stratum_targets = np.full(strata_count, target_rows // strata_count, dtype=np.int64)
+	stratum_targets[:target_rows % strata_count] += 1
+	reservoirs = [np.empty((int(stratum_targets[s]), contract_year), dtype=np.float32) for s in range(strata_count)]
+	strata_seen = np.zeros(strata_count, dtype=np.int64)
+	strata_filled = np.zeros(strata_count, dtype=np.int64)
 	strata_hits = np.zeros(strata_count, dtype=np.int64)
 	for _keys, data in iter_schedule_chunks(csv_dir, contract_year, normalize, chunk_size=chunk_size):
 		scores = np.sum(data, axis=1, dtype=np.float64)
@@ -148,15 +180,21 @@ def build_stratified_training_sample(csv_dir: Path, contract_year: int, normaliz
 		for s in range(strata_count):
 			idx = np.flatnonzero(bins == s)
 			if len(idx) == 0: continue
-			take = min(per_stratum_budget, len(idx))
-			chosen = rng.choice(idx, size=take, replace=False)
-			sampled_chunks.append(data[chosen])
-			strata_hits[s] += take
-	if not sampled_chunks: return np.empty((0, contract_year), dtype=np.float32)
-	sample = np.vstack(sampled_chunks).astype(np.float32, copy=False)
-	if len(sample) > target_rows:
-		idx = rng.choice(len(sample), size=target_rows, replace=False)
-		sample = sample[idx]
+			for row_idx in idx:
+				strata_seen[s] += 1
+				target = int(stratum_targets[s])
+				if target <= 0: continue
+				if strata_filled[s] < target:
+					reservoirs[s][strata_filled[s]] = data[row_idx]
+					strata_filled[s] += 1
+					strata_hits[s] += 1
+					continue
+				replace_at = int(rng.integers(0, int(strata_seen[s])))
+				if replace_at < target:
+					reservoirs[s][replace_at] = data[row_idx]
+	final_parts = [reservoirs[s][:int(strata_filled[s])] for s in range(strata_count) if int(strata_filled[s]) > 0]
+	if not final_parts: return np.empty((0, contract_year), dtype=np.float32)
+	sample = np.vstack(final_parts).astype(np.float32, copy=False)
 	print(f"Stratified sample built: rows={len(sample):,}, chunks={chunk_count}, strata={strata_count}, strata_hits={strata_hits.tolist()}.", flush=True)
 	return sample
 
@@ -166,32 +204,137 @@ def stage_sizes_for_progressive_fit(target_rows: int, stage_rows: tuple[int, ...
 	if not stage_sizes or stage_sizes[-1] != target_rows: stage_sizes.append(target_rows)
 	return stage_sizes
 
+def csv_chunk_size_for_contract(config: RunConfig, contract_year: int) -> int:
+	if contract_year == config.low_memory_contract_year: return config.low_memory_csv_chunk_size
+	return config.csv_chunk_size
+
+def center_block_size_for_contract(config: RunConfig, contract_year: int) -> int:
+	if contract_year == config.low_memory_contract_year: return config.low_memory_center_block_size
+	return config.default_center_block_size
+
+def configure_oneapi_selector_for_gpu(target_offload: str, selector: str) -> None:
+	if target_offload != "gpu": return
+	if not selector: return
+	current = os.environ.get("ONEAPI_DEVICE_SELECTOR")
+	if current:
+		print(f"ONEAPI_DEVICE_SELECTOR already set to '{current}'.", flush=True)
+		return
+	os.environ["ONEAPI_DEVICE_SELECTOR"] = selector
+	print(f"Set ONEAPI_DEVICE_SELECTOR={selector} for sklearnex GPU stability.", flush=True)
+
+def probe_sklearnex_offload_in_child(target_offload: str) -> tuple[bool, str]:
+	probe_code = (
+		"import numpy as np\n"
+		"from sklearnex import patch_sklearn, config_context\n"
+		"patch_sklearn()\n"
+		"from sklearn.cluster import KMeans\n"
+		"x = np.array([[0.0,0.0],[1.0,1.0],[9.0,9.0],[10.0,10.0]], dtype=np.float32)\n"
+		"with config_context(target_offload='" + target_offload + "'):\n"
+		"\tm = KMeans(n_clusters=2, n_init=1, max_iter=10, random_state=0, algorithm='lloyd')\n"
+		"\tm.fit(x)\n"
+		"print('PROBE_OK')\n"
+	)
+	try:
+		result = subprocess.run([sys.executable, "-c", probe_code], capture_output=True, text=True, timeout=20)
+	except subprocess.TimeoutExpired:
+		return False, "probe timed out after 20s"
+	except Exception as exc:
+		return False, f"probe launch failed: {type(exc).__name__}: {exc}"
+	stdout = (result.stdout or "").strip()
+	stderr = (result.stderr or "").strip()
+	if result.returncode == 0 and "PROBE_OK" in stdout:
+		return True, f"returncode=0 stdout={stdout} stderr={stderr}"
+	return False, f"returncode={result.returncode} stdout={stdout} stderr={stderr}"
+
+def describe_gpu_runtime_in_child() -> str:
+	probe_code = (
+		"import sys\n"
+		"print('python=' + sys.version.replace('\\n',' '))\n"
+		"try:\n"
+		"\timport sklearn\n"
+		"\tprint('sklearn=' + sklearn.__version__)\n"
+		"except Exception as e:\n"
+		"\tprint('sklearn_error=' + type(e).__name__ + ':' + str(e))\n"
+		"try:\n"
+		"\timport sklearnex\n"
+		"\tprint('sklearnex=' + sklearnex.__version__)\n"
+		"except Exception as e:\n"
+		"\tprint('sklearnex_error=' + type(e).__name__ + ':' + str(e))\n"
+		"try:\n"
+		"\timport dpctl\n"
+		"\tdevices = [str(d) for d in dpctl.get_devices()]\n"
+		"\tprint('dpctl_devices=' + ('; '.join(devices) if devices else '<none>'))\n"
+		"except Exception as e:\n"
+		"\tprint('dpctl_error=' + type(e).__name__ + ':' + str(e))\n"
+	)
+	try:
+		result = subprocess.run([sys.executable, "-c", probe_code], capture_output=True, text=True, timeout=20)
+	except subprocess.TimeoutExpired:
+		return "runtime probe timed out after 20s"
+	except Exception as exc:
+		return f"runtime probe launch failed: {type(exc).__name__}: {exc}"
+	stdout = (result.stdout or "").strip()
+	stderr = (result.stderr or "").strip()
+	return f"runtime_probe returncode={result.returncode} stdout=[{stdout}] stderr=[{stderr}]"
+
+def cached_offload_probe(target_offload: str) -> tuple[bool, str, bool]:
+	if target_offload in _offload_probe_cache:
+		ok, details = _offload_probe_cache[target_offload]
+		return ok, details, True
+	ok, details = probe_sklearnex_offload_in_child(target_offload)
+	_offload_probe_cache[target_offload] = (ok, details)
+	return ok, details, False
+
 def should_fallback_from_sklearnex(exc: Exception, target_offload: str) -> bool:
 	message = str(exc)
 	if "target_offload" in message and "DPC++ backend" in message: return True
 	if target_offload == "gpu" and "SyclQueue" in message: return True
 	if target_offload == "gpu" and "UR_RESULT_ERROR_DEVICE_LOST" in message: return True
 	if target_offload == "gpu" and "level_zero backend failed" in message: return True
+	if target_offload == "gpu": return True
 	return False
 
 def gpu_backend_error(exc: Exception) -> RuntimeError:
 	return RuntimeError(f"GPU offload was requested but sklearnex/oneDAL GPU execution failed. Current interpreter: {sys.executable}. If your GPU runtime is unstable (for example UR_RESULT_ERROR_DEVICE_LOST), set allow_cpu_fallback=True to permit an automatic CPU retry.")
 
 def fit_centers_gpu_progressive(sample_data: np.ndarray, k: int, max_iter: int, tol: float, seed: int, target_offload: str, stage_rows: tuple[int, ...], use_kmeans_plusplus: bool = True, allow_cpu_fallback: bool = False) -> tuple[np.ndarray, int]:
+	global _runtime_probe_logged
 	if len(sample_data) == 0: raise ValueError("No rows available for center fitting.")
+	configure_oneapi_selector_for_gpu(target_offload, CONFIG.oneapi_device_selector)
 	accelerated_kmeans: type[SklearnKMeans] | None = None
 	config_context: Callable[..., AbstractContextManager[None]] | None = None
 	use_sklearnex = False
-	try:
-		from sklearnex import patch_sklearn, config_context as sklearnex_config_context  # pyright: ignore[reportMissingTypeStubs, reportUnknownVariableType]
-		patch_sklearn()
-		from sklearn.cluster import KMeans as SklearnexKMeans
-		accelerated_kmeans = SklearnexKMeans
-		config_context = cast(Callable[..., AbstractContextManager[None]], sklearnex_config_context)
-		use_sklearnex = True
-		print(f"Using sklearnex KMeans with target_offload={target_offload}.", flush=True)
-	except Exception as exc:
-		print(f"sklearnex unavailable for accelerated fit ({type(exc).__name__}: {exc}). Falling back to plain sklearn CPU KMeans.", flush=True)
+	if allow_cpu_fallback and target_offload in _offload_force_cpu:
+		if target_offload not in _offload_force_cpu_logged:
+			print(f"GPU path disabled for target_offload={target_offload} after earlier probe failure; using plain sklearn CPU KMeans.", flush=True)
+			_offload_force_cpu_logged.add(target_offload)
+	else:
+		try:
+			from sklearnex import patch_sklearn, config_context as sklearnex_config_context  # pyright: ignore[reportMissingTypeStubs, reportUnknownVariableType]
+			patch_sklearn()
+			from sklearn.cluster import KMeans as SklearnexKMeans
+			accelerated_kmeans = SklearnexKMeans
+			config_context = cast(Callable[..., AbstractContextManager[None]], sklearnex_config_context)
+			use_sklearnex = True
+			print(f"Using sklearnex KMeans with target_offload={target_offload}.", flush=True)
+			if target_offload == "gpu":
+				ok, details, cached = cached_offload_probe(target_offload)
+				if cached:
+					if target_offload not in _offload_probe_logged:
+						print(f"Child-process GPU probe (cached): ok={ok}. {details}", flush=True)
+						_offload_probe_logged.add(target_offload)
+				else:
+					print(f"Child-process GPU probe: ok={ok}. {details}", flush=True)
+				if not _runtime_probe_logged:
+					print(describe_gpu_runtime_in_child(), flush=True)
+					_runtime_probe_logged = True
+				if not ok:
+					if not allow_cpu_fallback: raise RuntimeError(f"GPU probe failed before main fit. {details}")
+					print("GPU probe failed; switching to plain sklearn CPU KMeans before progressive stages.", flush=True)
+					_offload_force_cpu.add(target_offload)
+					use_sklearnex = False
+		except Exception as exc:
+			print(f"sklearnex unavailable for accelerated fit ({type(exc).__name__}: {exc}). Falling back to plain sklearn CPU KMeans.", flush=True)
 	actual_k = min(k, len(sample_data))
 	if actual_k <= 0: raise ValueError("No clusters can be fit from empty sample.")
 	rng = np.random.default_rng(seed)
@@ -399,7 +542,7 @@ def row_count_for_contract(csv_dir: Path, contract_year: int, normalize: bool, c
 		row_count += len(data)
 	return row_count
 
-def refine_centers_streaming_until_label_stable(csv_dir: Path, contract_year: int, normalize: bool, centers: np.ndarray, max_iter: int, stop_fraction: float = 1e-4, chunk_size: int = 100_000) -> tuple[np.ndarray, int, int, int]:
+def refine_centers_streaming_until_label_stable(csv_dir: Path, contract_year: int, normalize: bool, centers: np.ndarray, max_iter: int, stop_fraction: float = 1e-4, chunk_size: int = 100_000, center_block_size: int = 32) -> tuple[np.ndarray, int, int, int]:
 	# Streamed Lloyd refinement on full data with label-change stopping.
 	# Stops when changed labels < stop_fraction * pixel_count.
 	total_pixels = row_count_for_contract(csv_dir, contract_year, normalize, chunk_size=chunk_size)
@@ -423,7 +566,7 @@ def refine_centers_streaming_until_label_stable(csv_dir: Path, contract_year: in
 			row_cursor = 0
 			changed_labels = 0
 			for _keys, data_chunk in iter_schedule_chunks(csv_dir, contract_year, normalize, chunk_size=chunk_size):
-				labels = assign_labels_to_centers(data_chunk, centers)
+				labels = assign_labels_to_centers(data_chunk, centers, center_block_size=center_block_size)
 				n = len(labels)
 				curr_labels[row_cursor:row_cursor + n] = labels
 				if iteration > 1:
@@ -509,13 +652,15 @@ def cluster_trees (contract_years: int, k: list[int], write_to_CSV: bool = True,
 	config.contract_years = int(contract_years)
 	config.k_values = [int(value) for value in k]
 	config.write_to_CSV = bool(write_to_CSV)
+	effective_chunk_size = csv_chunk_size_for_contract(config, config.contract_years)
+	effective_center_block_size = center_block_size_for_contract(config, config.contract_years)
 	validate_config(config)
 	config.output_prefix.parent.mkdir(parents=True, exist_ok=True)
 	t0 = time.perf_counter()
 
 	print("Building stratified training sample from streamed CSV chunks...", flush=True)
 	sample_start = time.perf_counter()
-	training_data = build_stratified_training_sample(config.csv_dir, config.contract_years, config.normalize, target_rows=config.gpu_fit_sample_rows, chunk_size=config.csv_chunk_size, strata_count=config.sample_strata_count, sketch_per_chunk=config.sample_sketch_per_chunk, seed=config.seed + config.contract_years)
+	training_data = build_stratified_training_sample(config.csv_dir, config.contract_years, config.normalize, target_rows=config.gpu_fit_sample_rows, chunk_size=effective_chunk_size, strata_count=config.sample_strata_count, sketch_per_chunk=config.sample_sketch_per_chunk, seed=config.seed + config.contract_years)
 	if len(training_data) == 0: raise ValueError(f"No rows sampled for contract_years={config.contract_years}.")
 	print(f"Contract year {config.contract_years}: built training sample with {len(training_data):,} rows in {time.perf_counter() - sample_start:.2f} s.", flush=True)
 
@@ -525,7 +670,7 @@ def cluster_trees (contract_years: int, k: list[int], write_to_CSV: bool = True,
 		centers, iterations_run = fit_centers_gpu_progressive(training_data, cluster_count, config.max_iter, config.tol, config.seed + config.contract_years + cluster_count, config.sklearnex_target_offload, stage_rows=config.gpu_progressive_stage_rows, use_kmeans_plusplus=False, allow_cpu_fallback=config.allow_cpu_fallback)
 		if pass3_max_iter is not None:
 			print(f"Running pass 3 streamed refinement with max_iter={pass3_max_iter} and stop threshold 0.0001 * pixel_count.", flush=True)
-			centers, refine_iters, changed_labels, total_pixels = refine_centers_streaming_until_label_stable(config.csv_dir, config.contract_years, config.normalize, centers, max_iter=pass3_max_iter, stop_fraction=1e-4, chunk_size=config.csv_chunk_size)
+			centers, refine_iters, changed_labels, total_pixels = refine_centers_streaming_until_label_stable(config.csv_dir, config.contract_years, config.normalize, centers, max_iter=pass3_max_iter, stop_fraction=1e-4, chunk_size=effective_chunk_size, center_block_size=effective_center_block_size)
 			iterations_run = refine_iters
 			print(f"Pass 3 refinement done: iters={refine_iters}, last_changed_labels={changed_labels:,}, pixel_count={total_pixels:,}.", flush=True)
 		print(f"contract year {config.contract_years}: computed {len(centers)} carbon removal schedules for k={cluster_count} in {time.perf_counter() - cluster_start:.2f} s.", flush=True)
@@ -548,26 +693,33 @@ def cluster_trees (contract_years: int, k: list[int], write_to_CSV: bool = True,
 		total_squared_distance = 0.0
 		max_squared_distance = 0.0
 		pass_start = time.perf_counter()
-		for chunk_index, (keys, data_chunk) in enumerate(iter_schedule_chunks(config.csv_dir, config.contract_years, config.normalize, chunk_size=config.csv_chunk_size), start=1):
-			labels = assign_labels_to_centers(data_chunk, centers)
-			chunk_centers = centers[labels]
-			delta = data_chunk - chunk_centers
-			squared_distances = np.sum(delta*delta, axis=1, dtype=np.float64)
-			total_pixels += len(data_chunk)
-			total_squared_distance += float(squared_distances.sum())
-			if len(squared_distances): max_squared_distance = max(max_squared_distance, float(squared_distances.max()))
-			for cluster_id in range(len(centers)):
-				mask = labels == cluster_id
-				if not np.any(mask): continue
-				cluster_vals = squared_distances[mask]
-				cluster_pixel_count[cluster_id] += int(mask.sum())
-				cluster_total_squared_distance[cluster_id] += float(cluster_vals.sum())
-				cluster_max_squared_distance[cluster_id] = max(cluster_max_squared_distance[cluster_id], float(cluster_vals.max()))
+		assign_writer = None
+		assign_handle = None
+		try:
 			if config.write_to_CSV:
-				assign_df = pd.DataFrame({"contract_years": config.contract_years, "k": cluster_count, "pixel_id": keys, "cluster_id": labels})
-				assign_df.to_csv(assignments_path, mode="a", header=False, index=False)
-			if chunk_index % 10 == 0:
-				print(f"  assignment pass chunk={chunk_index}, rows={total_pixels:,}", flush=True)
+				assign_handle = open(assignments_path, "a", newline="", encoding="utf-8")
+				assign_writer = csv.writer(assign_handle)
+			for chunk_index, (keys, data_chunk) in enumerate(iter_schedule_chunks(config.csv_dir, config.contract_years, config.normalize, chunk_size=effective_chunk_size), start=1):
+				labels = assign_labels_to_centers(data_chunk, centers, center_block_size=effective_center_block_size)
+				chunk_centers = centers[labels]
+				delta = data_chunk - chunk_centers
+				squared_distances = np.sum(delta*delta, axis=1).astype(np.float64, copy=False)
+				total_pixels += len(data_chunk)
+				total_squared_distance += float(squared_distances.sum())
+				if len(squared_distances): max_squared_distance = max(max_squared_distance, float(squared_distances.max()))
+				cluster_pixel_count += np.bincount(labels, minlength=len(centers)).astype(np.int64, copy=False)
+				cluster_total_squared_distance += np.bincount(labels, weights=squared_distances, minlength=len(centers))
+				if len(labels):
+					chunk_max = np.full(len(centers), -np.inf, dtype=np.float64)
+					np.maximum.at(chunk_max, labels, squared_distances)
+					valid = np.isfinite(chunk_max)
+					cluster_max_squared_distance[valid] = np.maximum(cluster_max_squared_distance[valid], chunk_max[valid])
+				if assign_writer is not None:
+					assign_writer.writerows((int(config.contract_years), int(cluster_count), int(pixel_id), int(cluster_id)) for pixel_id, cluster_id in zip(keys, labels, strict=False))
+				if chunk_index % 10 == 0:
+					print(f"  assignment pass chunk={chunk_index}, rows={total_pixels:,}", flush=True)
+		finally:
+			if assign_handle is not None: assign_handle.close()
 		print(f"assignment/stat pass finished in {time.perf_counter() - pass_start:.2f} s over rows={total_pixels:,}.", flush=True)
 
 		mean_squared_distance = total_squared_distance / total_pixels
