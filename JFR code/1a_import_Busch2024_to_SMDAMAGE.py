@@ -31,7 +31,7 @@
 # genus, establishment costs, crop opportunity value, area, biome, FAO ecozone, and
 # geographic screen variables (griscom, brancalion, bastin, walker).
 #
-# Output: Output/Databases/Busch2024_to_SMDAMAGE.sqlite, two tables:
+# TODO, this is out of date. Output: Output/Databases/Busch2024_to_SMDAMAGE.sqlite, two tables:
 # Undiscounted_dta_output, one row per pixel:
 # country, pixel_id, option (NR or plantation genus), best_contract_length,
 # bid (USD/ha at best_contract_length), bid_score (int, bid/warming at best_contract_length),

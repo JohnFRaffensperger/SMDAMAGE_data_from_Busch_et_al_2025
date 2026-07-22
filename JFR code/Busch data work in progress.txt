@@ -1,115 +1,100 @@
-## Plan for bringing the data into SMDAMAGE
+## Area bug audit — 2026-07-22
 
-## Current state (2026-07-18)
-1. DONE: `1a_import_Busch2024_to_SMDAMAGE.py` ran successfully and produced `undiscounted_contracts_020.csv` ... `undiscounted_contracts_120.csv`.
-2. DONE: `2_k_means_carbon_removal.py` ran successfully and produced `k_means_carbon_removal_contract_years_*` centers/assignments/summary/overall files.
-3. NEXT: rebuild the SQLite bridge from these CSV outputs, then rebuild forestry bid curves for SMDAMAGE.
+Scenario 12 in `smdamage_solutions.db` uses roughly 10–50 times as much land as Busch et al. report as feasible in the paper. This audit traced the cause through the full pipeline from the raw `.dta` files to the SMDAMAGE LP.
 
-## Old `Old Busch2024_to_SMDAMAGE.sqlite` schema
-1. `Undiscounted_dta_output`: country, pixel_id, plantation_genus, selected_option, selected_A, selected_k, selected_rotation_year, area_ha, 
-crop_va_USD_per_ha_per_year, selected_establishment_cost_USD_per_ha, p_USD_per_tC_harvested, NPV_0_pct_per_ha, NPV_015_pct_per_ha, NPV_03_pct_per_ha, NPV_06_pct_per_ha, selected_rotation_year_int.
-2. `tC_per_h_per_year`: country, pixel_id, year, tC_per_ha_per_year
-3. `carbon_removal_schedules`: selected_rotation_year, cluster_index, year, tC_per_ha_per_year, pixel_count, total_area_ha
-4. `forestry_bid_curves`: selected_rotation_year_int, cluster_index, discount_rate, bucket_id, npv_column, npv_min_per_ha, npv_max_per_ha, area_ha_sum, bucket_area_share.
+### Key numbers
+Total raw pixel area stored in `Pixel_bids`, 5,309 Mha |
+SMDAMAGE `total_area` land constraint, 5,309 Mha |
+Peak new contracts signed per year (scenario 12), 90–135 Mha/yr |
+Land constraint first becomes binding, ~2080 |
+Griscom-screened area (10 largest countries), ~15% of raw |
+Griscom + buffer + additionality (same sample), ~12.5% of raw |
+Implied global screened area (~12.5% × 5,309), ~664 Mha |
+Overestimation factor, ~8–10× |
 
-## New Busch2024_to_SMDAMAGE.sqlite schema 
-1. `Pixel_bids`: int pixel_id, int cluster_id, text selected_option, int contract_years, float area_ha, float NPV_0_pct_per_ha, float NPV_015_pct_per_ha, float NPV_03_pct_per_ha, float NPV_06_pct_per_ha.
-2. `cluster_carbon_schedules_{years}`, one table for each contract year length: int cluster_id, int growth_year, float tC_per_ha_per_year.
-3. `cluster_forestry_bid_curves_{years}`, one table for each contract year length: int cluster_id, int discount_rate_00 in [0, 15, 30, 60], int bid_step, float npv_max_per_ha, float step_area_ha.
+### Bug: raw pixel area stored in `area_ha` omits several filters.
 
-## Script responsibilities and why both are needed
+The code reads the Griscom screen and buffer from the `.dta` file into the chunk (both are in `KEEP_COLS`) but are then dropped in `KEEP_FOR_OUTPUT` and never multiplied into `area_ha`.
+As a result, in `1a_import_Busch2024_to_SMDAMAGE.py`, `process_chunk()`, 
+	all_rows_for_one_country["area_ha"] = all_rows_for_one_country["area_m2"] / 10000.0 stores the full pixel area. 
+But Busch et al.'s paper reports feasible area (primary scenario `mi_whrv_sGr_bu_ad`) as `area × griscom × (1 − BAUrefor)`.
 
-1. `3_import_k_means_csv_to_sqlite.py` is the loader and schema-builder.
-2. `4_move_Busch_data_to_SMDAMAGE.py` is the bid-curve builder and exporter.
+Filter 1. OMIT because Busch et al don't use it in their MACC curves. `nr_buffer` and `pl_buffer` are carbon permanence-risk discount fractions (0–1), one per pixel, following carbon registry methodology. 
+A value of 0.9 means 90% of the credited carbon is treated as bankable and issued as offsets; 10% is withheld into a buffer pool against future reversal 
+from fire, disease, drought, or land-use change. Natural regeneration and plantation carbon face different permanence risk, so the fields are separate.
+The buffer is a permanence-risk discount used by carbon registries; including it here is conservative and appropriate. 
 
-Keep them separate so I can rerun imports without recomputing bid curves, and rerun bid curves without rebuilding all tables.
+The buffer appears in two distinct roles in the Stata code.
 
-### Quick input/output summary
-1. `3_import_k_means_csv_to_sqlite.py`
-	- Inputs: `undiscounted_contracts_*.csv` and `k_means_carbon_removal_contract_years_*` assignments/centers/summary CSV files.
-	- Outputs: refreshed SQLite `Pixel_bids` plus rebuilt `cluster_carbon_schedules_{years}` tables, with `cluster_id` populated in `Pixel_bids`.
-2. `4_move_Busch_data_to_SMDAMAGE.py`
-	- Inputs: SQLite `Pixel_bids` (including `cluster_id`, `contract_years`, `area_ha`, and `NPV_*_per_ha`).
-	- Outputs: rebuilt SQLite `cluster_forestry_bid_curves_{years}` tables and run-time checks/logs for row counts and bid monotonicity.
+First, their Stata code uses `nr_buffer` and `pl_buffer` to choose the least-cost option for each pixel:
+    refortype_whrv_bu = "P"  if  (3.67 * pl_whrv_totalC * pl_buffer) / pl_cost  >  (3.67 * nr_wohrv_totalC * nr_buffer) / nr_cost
+    refortype_whrv_bu = "N"  otherwise
 
-## Required changes to script 3 (loader)
+The winning option's full (unscaled) carbon is then stored as `mi_whrv_bu_totalC`, the raw carbon of the winner, not the buffer-reduced carbon:
+	mi_whrv_bu_totalC = pl_whrv_totalC   if refortype_whrv_bu == "P"; 
+    mi_whrv_bu_totalC = nr_wohrv_totalC  if refortype_whrv_bu == "N"
 
-### Scope
-`3_import_k_means_csv_to_sqlite.py` should read:
-1. `undiscounted_contracts_*.csv`
-2. `k_means_carbon_removal_contract_years_*_assignments.csv`
-3. `k_means_carbon_removal_contract_years_*_centers.csv`
-4. `k_means_carbon_removal_contract_years_*_summary.csv`
+Second, in calculating the MAC curves. Their Stata code separate NR-only and plantation-only MAC curves, 
+and they do multiply carbon by the option-specific buffer:
+    nr_wohrv_sGr_bu_ad = nr_wohrv_totalC * griscom * nr_buffer * (1 − BAUrefor)
+    pl_wohrv_sGr_bu_ad = pl_wohrv_totalC * griscom * pl_buffer * (1 − BAUrefor)
 
-### Table build rules
-1. Build `Pixel_bids` from `undiscounted_contracts_*.csv`.
-	- `pixel_id <- pixel_id`
-	- `selected_option <- option`
-	- `contract_years <- best_contract_length`
-	- `area_ha <- area_ha`
-	- `NPV_0_pct_per_ha <- bid_r000`
-	- `NPV_015_pct_per_ha <- bid_r015`
-	- `NPV_03_pct_per_ha <- bid_r030`
-	- `NPV_06_pct_per_ha <- bid_r060`
+The paper's main reported cost-minimising MAC curve is `mi_whrv_sGr_bu_ad`, constructed as:
+    mi_whrv_sGr_bu    = mi_whrv_bu_totalC * griscom          ← no buffer multiplier
+    mi_whrv_sGr_bu_ad = (1 − BAUrefor) * mi_whrv_sGr_bu
 
-2. Build one carbon table per contract length:
-	- `cluster_carbon_schedules_{years}`
-	- source: centers CSV (`cluster_id`, `year_1..year_T`)
-	- output rows: `(cluster_id, growth_year, tC_per_ha_per_year)`
+The primary composite MAC curve has no `* nr_buffer` or `* pl_buffer`. The buffer was consumed during option selection; 
+it does not appear again as a scaling factor on carbon or area.
 
-3. Update `Pixel_bids.cluster_id` from assignments CSV:
-	- assignments columns: `contract_years`, `pixel_id`, `cluster_id`
-	- join key: `(pixel_id, contract_years)`
-	- rule: every imported pixel row must receive one cluster_id
+Implication for the fix. `winner_buffer` in the proposed code is `nr_buffer` where NR wins, `pl_buffer` where plantation wins. 
+Applying `winner_buffer` to `area_ha` would match the individual-option MAC curves (Role 2 above) but NOT the primary composite MAC curve (`mi_whrv_sGr_bu_ad`). 
+Since SMDAMAGE operates on per-pixel winning options (analogous to the composite scenario), the correct area multiplier for matching Busch et al.'s primary numbers
+is `griscom` alone, not `griscom * winner_buffer`.
 
-4. Table lifecycle rule:
-	- clear and rebuild `Pixel_bids`
-	- drop/recreate `cluster_carbon_schedules_{years}` tables for all years present
-	- this avoids stale rows from prior runs
+So you should apply the buffer to the carbon schedule (tC_per_ha_per_year outputs): multiply the `cs` array by `winner_buffer` before writing each pixel's year-by-year carbon to CSV.
+This reduces the carbon credited per hectare while leaving the available land area unchanged, which is how carbon registry permanence discounting actually works. 
+Currently the Python code applies no buffer anywhere (neither to area nor to the carbon schedule), which is a separate existing divergence from the Stata logic.
 
-### Verification checks in script 3
-1. For each `{years}`, assignment row count equals `Pixel_bids` row count where `contract_years={years}`.
-2. For each `{years}`, distinct `cluster_id` count in centers equals summary equals assignments.
-3. For each `{years}`, all assignment `pixel_id` values exist in `Pixel_bids` for the same `contract_years`.
-4. In `Pixel_bids`, `(pixel_id, contract_years)` is unique.
-5. After assignment update, no null `cluster_id` remains in `Pixel_bids`.
+Filter 2. TAKE NO ACTION. "Business as usual": the code does not read the business-as-usual BAU fields. 
 
-## Required changes to script 4 (bid curves)
+Busch et al write: "Finally, we subtract the fraction of reforestation that was unlikely to be additional, that is, is likely to occur under business-as-usual."
+`bau_2020_2030`, `bau_2030_2040`, `bau_2040_2050` are pixel-level projected reforestation rates for the decades 2020–2030, 2030–2040, and 2040–2050 
+under a business-as-usual (no-policy) scenario, from Busch et al. (2019). Each value is a fraction (0–1) of the pixel area expected to spontaneously reforest 
+in that decade without policy intervention. Busch et al. (2024) combine them into a single NPV-weighted estimate:
 
-### Scope
-`4_move_Busch_data_to_SMDAMAGE.py` should read `Pixel_bids` and write `cluster_forestry_bid_curves_{years}`.
+    BAUrefor = bau_2020_2030 × 0.510928 + bau_2030_2040 × 0.305911 + bau_2040_2050 × 0.183161
 
-### Core logic
-1. Do not recompute NPV from establishment cost or harvest-value components.
-2. Use `NPV_*_per_ha` from `Pixel_bids` as authoritative cost inputs.
-3. For each `years` and each `cluster_id`, sort pixels by NPV and bucket by area share.
-4. Keep current default rule:
-	- bucket size: 3% of area
-	- omit top-cost tail: 1% of area
-5. Write rows as:
-	- `cluster_id`
-	- `discount_rate_00` in `{0, 15, 30, 60}`
-	- `bid_step`
-	- `npv_max_per_ha`
-	- `step_area_ha`
+The weights 0.510928, 0.305911, 0.183161 are the present-value factors for a uniform flow within each decade discounted at 5% per year to year 0. 
+For pixels outside the tropics where BAU data are missing, Busch et al. substitute a global default of 0.0571795 (about 5.7% BAU reforestation). 
+The effective additional area per pixel is then `area_ha × (1 − BAUrefor)`. `bau_2020_2030`, `bau_2030_2040`, `bau_2040_2050` are never read from the `.dta` files. 
+So even if additionality screening were wanted, it cannot be computed.
 
-### Run entrypoint
-Add one main run path that:
-1. discovers contract years from `Pixel_bids`
-2. rebuilds `cluster_forestry_bid_curves_{years}`
-3. logs row counts by `(years, discount_rate_00)`
-4. verifies monotonicity per curve (non-decreasing `npv_max_per_ha` by `bid_step`)
+**Why it may be inappropriate in SMDAMAGE.** The BAU adjustment subtracts reforestation that would have happened anyway, giving the *marginal* impact of a policy. 
+In SMDAMAGE the LP is itself choosing the policy — the optimizer already decides how much reforestation to purchase. 
+Reducing available area by a historical BAU fraction would effectively pre-subtract area that the optimizer has not yet decided to buy, which double-counts the intervention. 
+It is therefore probably correct to omit BAUrefor from the SMDAMAGE area constraint, even though it is essential for matching Busch et al.'s reported MAC curve quantities.
 
-## Execution order
-1. Run `1a_import_Busch2024_to_SMDAMAGE.py` (already done).
-2. Run `2_k_means_carbon_removal.py` (already done).
-3. Run updated `3_import_k_means_csv_to_sqlite.py`.
-4. Run updated `4_move_Busch_data_to_SMDAMAGE.py`.
-5. Export or connect these tables into SMDAMAGE.
+[JFR: I discarded this "business as usual" concept because it is a present value. But I do my own discounting, so the BAU discounting would introduce double discounting and at different discount rates.]
 
-## SMDAMAGE-side integration target
-1. Bidder identity: `(contract_years, cluster_id)`.
-2. Carbon schedule: `cluster_carbon_schedules_{years}`.
-3. Bid steps: `cluster_forestry_bid_curves_{years}`.
-4. Area cap basis: sum of `Pixel_bids.area_ha` by `(contract_years, cluster_id)`.
-5. Land constraints: enforce overlap across active contract vintages.
+Filter 3. FIX. "Griscom screen" and winner buffer only (matches Busch et al.'s standard screened scenario). 
+The Griscom screen limits reforestation to ecologically eligible land and must be applied. 
+Busch et al write: "We further constrain plantation reforestation to areas near existing plantations (and hence, near markets for harvested wood); 
+we constrain natural regeneration to areas near existing natural forests (and hence, near seed sources)."
+
+The `griscom` column is a fraction (0–1) giving the share of each pixel that falls within the reforestation potential map of Griscom et al. (2017).
+That map identifies land where trees can grow (based on native biome and climate) but that is not currently forested, 
+not required for crops or pasture, and not urban. A pixel with `griscom = 0.15` has 15% of its area eligible for reforestation under the Griscom criteria.
+For Busch et al.'s purposes `griscom` is a multiplicative scalar on carbon and, implicitly, on effective area: `area_ha × griscom` is the reforestable hectares within the pixel.
+
+CONCLUSION. In `process_chunk()`, after the code determines `best_option` and before the CSV write:
+    griscom = all_rows_for_one_country.get("griscom", np.zeros(N))
+    all_rows_for_one_country["area_ha"] = all_rows_for_one_country["area_ha"] * griscom
+    # winner_buffer belongs on the carbon schedule, not on area:
+    # winner_buffer = np.where(best_option == "NR",
+    #     all_rows_for_one_country.get("nr_buffer", np.ones(N)),
+    #     all_rows_for_one_country.get("pl_buffer", np.ones(N)))
+    # cs[j] *= winner_buffer[sidx[j]]   ← apply inside the CSV write loop
+
+Apply Griscom `area_ha`. Apply buffer to the carbon schedule. 
+
+[JFR: The code should apply in the carbon schedule, before choosing the best option.]
