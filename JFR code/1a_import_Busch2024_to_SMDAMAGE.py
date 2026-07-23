@@ -70,7 +70,7 @@ for _k, _v in GENUS_BY_TYPE.items(): _GENUS_LOOKUP[_k] = _v
 # In the Chapman-Richards growth function, A is the asymptotic growth peak and k is the % growth per year.
 KEEP_COLS = {"biomes", "nr_A", "nr_k", "type", "fao_ecoz", "area_m2", "nr_cost", "ep_cost", "np_cost", "crop_va", "griscom", "brancalion", "bastin", "walker", "nr_buffer", "pl_buffer"} | {f"{g}_{s}" for g in GENUS_ORDER for s in ["A", "k"]}
 CLAMP_COLS = ["nr_A", "nr_k"] + [f"{g}_{s}" for g in GENUS_ORDER for s in ["A", "k"]] # Precomputed to avoid per-chunk list construction.
-KEEP_FOR_OUTPUT = {"id", "nr_A", "nr_k", "nr_rootshoot", "pl_rootshoot", "area_ha", "crop_va"} | {f"{g}_{s}" for g in GENUS_ORDER for s in ["A", "k"]} # Columns needed for SQLite output; all others dropped before valid-mask filter.
+KEEP_FOR_OUTPUT = {"id", "nr_A", "nr_k", "nr_rootshoot", "pl_rootshoot", "area_ha", "crop_va", "nr_buffer", "pl_buffer"} | {f"{g}_{s}" for g in GENUS_ORDER for s in ["A", "k"]} # Columns needed for SQLite output; all others dropped before valid-mask filter.
 # TIME_HORIZON_YEARS = 120 # Must cover the full contract-length range (lengths goes to 115).
 AUSTMANN_F = 1
 NATURAL_SOIL_C = 0.415107735
@@ -263,6 +263,7 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], csv
 	nr_scale = 2*nr_A*nr_k*(AGB_C_POOL + BGB_C_POOL*nr_rootshoot) # (N,)
 	_e1_nr = np.exp(-nr_k.astype(np.float32)[:,None]*T_ARR_F32) # float32 exp; ~2x faster; use e**2 instead of second call.
 	cs_nr = (nr_scale.astype(np.float32)[:,None]*(_e1_nr - _e1_nr**2) + np.float32(SOIL_C_POOL*NATURAL_SOIL_C)) # (N, T_MAX+1) float32
+	cs_nr *= all_rows_for_one_country["nr_buffer"].astype(np.float32)[:, None] # permanence buffer: bankable fraction of annual carbon, applied before option selection
 	warming_arr = WPT_MAT_F32 @ cs_nr.T # float32 SGEMM; ~2x faster than float64 DGEMM
 	bid_arr = all_rows_for_one_country["nr_cost"] + all_rows_for_one_country["crop_va"] * DISC_ARR[:, None] # (N_L, N)
 	# Find the contract length with cheapest $/(cooling °C) for natural regeneration.
@@ -292,6 +293,7 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], csv
 		pl_scale = 2*A_g*k_g*(AGB_C_POOL + BGB_C_POOL*rs_g) # (Ng,)
 		_e1_pl = np.exp(-k_g.astype(np.float32)[:,None]*T_ARR_F32) # float32 exp; ~2x faster; use e**2 instead of second call.
 		cs_pl = (pl_scale.astype(np.float32)[:,None]*(_e1_pl - _e1_pl**2) + np.float32(SOIL_C_POOL*PLANTATION_SOIL_C)) # (Ng, T_MAX+1) float32
+		cs_pl *= all_rows_for_one_country["pl_buffer"][mask_g].astype(np.float32)[:, None] # permanence buffer: bankable fraction of annual carbon, applied before option selection
 		warming_g = WPT_MAT_F32 @ cs_pl.T # float32 SGEMM
 		if g == "cunn": est_cost = all_rows_for_one_country["np_cost"][mask_g] if iso == "CHN" else all_rows_for_one_country["ep_cost"][mask_g]
 		elif g == "euca": est_cost = all_rows_for_one_country["ep_cost"][mask_g]
@@ -324,6 +326,9 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], csv
 	crop_va = all_rows_for_one_country["crop_va"]
 	# best_bids_multi[ri, n] = est_cost[n] + crop_va[n]*annuity(r_i, T_n) - harvest_at_T[n] / (1+r_i)^T_n
 	best_bids_multi = best_est_cost[None, :] + crop_va[None, :] * DISC_ARR_MULTI[:, li] - best_harvest_at_T[None, :] / COMPOUND_ARR_MULTI[:, li]  # (4, N)
+
+	# Apply Griscom screen: reduce area_ha to the reforestable fraction of each pixel (Griscom et al. 2017).
+	all_rows_for_one_country["area_ha"] *= all_rows_for_one_country.get("griscom", np.zeros(N))
 
 	# Memory: drop columns not needed for CSV output before the valid-mask filter.
 	for _k in list(all_rows_for_one_country):
@@ -361,6 +366,7 @@ def process_chunk(iso: str, all_rows_for_one_country: dict[str, np.ndarray], csv
 			cs = (2*As[:, None]*ks[:, None]*(np.float32(AGB_C_POOL) + np.float32(BGB_C_POOL)*rss[:, None]) * (_e1_cs - _e1_cs**2) + np.float32(soil))
 			if opt != "NR": cs[:, -1] -= np.float32(HARVEST_C_POOL) * As * (1.0 - np.exp(-ks * np.float32(T)))**2
 			sidx = gidx[sub]  # global pixel indices for this (opt, T) group
+			cs *= all_rows_for_one_country["nr_buffer" if opt == "NR" else "pl_buffer"][sidx].astype(np.float32)[:, None] # permanence buffer on output carbon schedule
 			pids = ids[sidx]
 			writer = csv_writers[T]
 			bids = best_bids_multi[:, sidx]  # (4, n_sub)
